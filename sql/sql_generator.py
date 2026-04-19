@@ -3,8 +3,6 @@
 # ==========================================
 
 from llm.provider import get_llm
-from llm.prompt_builder import build_prompt
-from rag.schema_selector import schema_selector
 
 llm = get_llm()
 
@@ -86,36 +84,22 @@ def build_join_context(selected_tables):
 
 
 def generate_sql(query: str, context: str = "") -> str:
+    """
+    Generate SQL from an input prompt/query.
 
-    # STEP 1: Select schema
-    selected_schema = schema_selector(query)
+    Notes:
+    - In the current graph flow, `query` is already a fully built SQL prompt.
+    - In legacy flows, `query` can still be a plain user query, and callers may
+      pass additional context through `context`.
+    """
+    prompt = query.strip()
+    if context:
+        prompt = f"{prompt}\n\nAdditional Context:\n{context}"
 
-    print("[SCHEMA SELECTED]:", selected_schema.keys())
-
-    # STEP 2: Build schema context
-    schema_context = build_schema_context(selected_schema)
-
-    # STEP 3: Build JOIN context
-    join_context = build_join_context(selected_schema.keys())
-
-    # Combine all context
-    full_context = f"""
-{schema_context}
-
-{join_context}
-
-ADDITIONAL CONTEXT:
-{context}
-"""
-
-    # STEP 4: Build prompt
-    prompt = build_prompt(query, full_context)
-
-    # STEP 5: LLM call
     response = llm.invoke(prompt)
     sql = clean_sql(response.content)
 
-    # STEP 6: Validation (existing)
+    # Basic safety checks
     sql_lower = sql.lower()
 
     if "count(" in sql_lower and "group by" not in sql_lower:
@@ -127,7 +111,6 @@ ADDITIONAL CONTEXT:
     if not sql_lower.startswith("select"):
         raise ValueError("Only SELECT queries allowed")
 
-    print("[JOIN CONTEXT]:\n", join_context)
     print("[SQL_GENERATOR] Generated SQL:\n", sql)
 
     return sql

@@ -45,3 +45,17 @@ def get_sql_tools(db):
         QuerySQLDatabaseTool(),  # custom structured tool
         result_processor         # explanation tool
     ]
+
+
+def execute_sql(query: str):
+    """
+    Backward-compatible SQL execution helper used by graph nodes.
+    Returns a structured dictionary:
+    {
+      "rows": [...],
+      "columns": [...],
+      "error": "...",   # only when failure
+    }
+    """
+    tool = QuerySQLDatabaseTool()
+    return tool._run(query)

@@ -24,7 +24,7 @@ from sql.sql_generator import generate_sql
 from sql.sql_validator import validate_sql
 from sql.result_processor import process_result
 
-from sql.db_schema import load_db_schema
+from sql.db_schema import get_db_schema
 from tools.sql_tools import execute_sql
 
 
@@ -45,9 +45,20 @@ def _normalize_router_output(router_output: Any) -> str:
     Normalize router output to one of:
     attendance, leave, attendance_explanation, policy, irrelevant
     """
-    if isinstance(router_output, str):
-        intent = router_output.strip().lower()
+    def _map_intent(raw: str) -> str:
+        intent = (raw or "").strip().lower()
+
+        alias_map = {
+            "explanation": "attendance_explanation",
+            "reasoning": "attendance_explanation",
+            "why": "attendance_explanation",
+            "shift": "attendance",
+        }
+        intent = alias_map.get(intent, intent)
         return intent if intent in VALID_INTENTS else "irrelevant"
+
+    if isinstance(router_output, str):
+        return _map_intent(router_output)
 
     if isinstance(router_output, dict):
         raw_intent = (
@@ -56,8 +67,7 @@ def _normalize_router_output(router_output: Any) -> str:
             or router_output.get("label")
             or "irrelevant"
         )
-        intent = str(raw_intent).strip().lower()
-        return intent if intent in VALID_INTENTS else "irrelevant"
+        return _map_intent(str(raw_intent))
 
     return "irrelevant"
 
@@ -112,7 +122,7 @@ def _safe_get_available_schema() -> Dict[str, Any]:
     Used as an allowlist so selector only returns real DB tables.
     """
     try:
-        schema = load_db_schema()
+        schema = get_db_schema()
         return schema if isinstance(schema, dict) else {}
     except Exception:
         return {}

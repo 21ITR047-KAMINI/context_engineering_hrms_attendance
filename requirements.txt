@@ -1,13 +1,12 @@
 
 pydantic
-sqlalchemylanggraph
+sqlalchemy
+langgraph
 streamlit
 langchain
 langchain-core
 langchain-community
-langgraph
 langchain-ollama
-sqlalchemy
 pyodbc
 fastapi
 uvicorn
