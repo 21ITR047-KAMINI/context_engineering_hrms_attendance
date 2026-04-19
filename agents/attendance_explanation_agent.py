@@ -351,7 +351,7 @@ def reason_over_result(
     if normalized_result.get("row_count", 0) == 0:
         return "Data not found"
 
-    explanation_llm = llm or get_llm("general")
+    explanation_llm = llm or get_llm("explanation")
 
     prompt = _build_explanation_prompt(
         query=clean_query,
