@@ -1,10 +1,27 @@
-import streamlit as st
-import pandas as pd
 import html
+import streamlit as st
 
 
 def _safe_text(value) -> str:
     return html.escape("" if value is None else str(value))
+
+
+def _render_kpi_cards(metrics):
+    st.markdown("<div class='kpi-grid'>", unsafe_allow_html=True)
+    for metric in metrics:
+        tone = metric.get("tone", "neutral")
+        st.markdown(
+            f"""
+            <div class='kpi-card {tone}'>
+                <div class='kpi-delta'>{_safe_text(metric.get("delta", ""))}</div>
+                <div class='kpi-value'>{_safe_text(metric.get("value", ""))}</div>
+                <div class='kpi-label'>{_safe_text(metric.get("label", ""))}</div>
+                <div class='kpi-sub'>{_safe_text(metric.get("sub", ""))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_chat(messages):
@@ -12,7 +29,6 @@ def render_chat(messages):
         role = msg.get("role", "")
         content = msg.get("content", "")
 
-        # USER MESSAGE
         if role == "user":
             st.markdown(
                 f"""
@@ -22,11 +38,10 @@ def render_chat(messages):
                     </div>
                 </div>
                 """,
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
             continue
 
-        # ASSISTANT LOADING
         if msg.get("loading", False):
             st.markdown(
                 """
@@ -34,29 +49,33 @@ def render_chat(messages):
                     <div class="thinking-text">Thinking...</div>
                 </div>
                 """,
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
             continue
 
-        # ASSISTANT STRUCTURED RESPONSE
         if isinstance(content, dict):
-            explanation = content.get("explanation")
-            rows = content.get("rows", [])
-            columns = content.get("columns", [])
+            title = content.get("title", "Attendance Summary")
+            subtitle = content.get("subtitle", "AI-generated analysis")
+            explanation = content.get("explanation", "")
+            metrics = content.get("metrics", [])
 
-            # No HTML bubble here, because Streamlit elements won't stay inside it
-            with st.container():
-                if explanation:
-                    st.markdown("### Summary & Insights")
-                    st.write(explanation)
+            st.markdown(
+                f"""
+                <div class='assistant-card'>
+                    <div class='assistant-head'>
+                        <div class='assistant-title'>{_safe_text(title)}</div>
+                        <div class='assistant-sub'>{_safe_text(subtitle)}</div>
+                    </div>
+                    <div class='assistant-body'>{_safe_text(explanation)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-                if rows and columns:
-                    df = pd.DataFrame(rows, columns=columns)
-                    st.markdown("### Data")
-                    st.dataframe(df, width="stretch")
+            if metrics:
+                _render_kpi_cards(metrics)
             continue
 
-        # ASSISTANT NORMAL TEXT RESPONSE
         st.markdown(
             f"""
             <div class="chat-row bot-row">
@@ -65,5 +84,5 @@ def render_chat(messages):
                 </div>
             </div>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
