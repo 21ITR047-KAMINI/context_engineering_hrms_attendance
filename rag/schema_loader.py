@@ -18,6 +18,9 @@ class SchemaLoaderError(Exception):
     """Raised when schema loading or validation fails."""
 
 
+# ------------------------------------------
+# INTERNAL HELPERS
+# ------------------------------------------
 def _read_json_file(schema_path: Path) -> Dict[str, Any]:
     """
     Read schema JSON file safely.
@@ -44,6 +47,22 @@ def _read_json_file(schema_path: Path) -> Dict[str, Any]:
         raise SchemaLoaderError("Top-level schema JSON must be a dictionary/object.")
 
     return data
+
+
+def _clean_string_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+
+    output: List[str] = []
+    seen = set()
+
+    for item in values:
+        cleaned = str(item).strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            output.append(cleaned)
+
+    return output
 
 
 def _validate_table_metadata(table_name: str, table_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -75,41 +94,29 @@ def _validate_table_metadata(table_name: str, table_data: Dict[str, Any]) -> Dic
     if not isinstance(normalized["description"], str):
         raise SchemaLoaderError(f"'description' must be a string for table '{table_name}'.")
 
-    if not isinstance(normalized["primary_keys"], list):
-        raise SchemaLoaderError(f"'primary_keys' must be a list for table '{table_name}'.")
-
-    if not isinstance(normalized["business_keys"], list):
-        raise SchemaLoaderError(f"'business_keys' must be a list for table '{table_name}'.")
-
     if not isinstance(normalized["columns"], dict):
         raise SchemaLoaderError(f"'columns' must be an object/dictionary for table '{table_name}'.")
 
-    if not isinstance(normalized["used_for"], list):
-        raise SchemaLoaderError(f"'used_for' must be a list for table '{table_name}'.")
-
-    if not isinstance(normalized["join_hints"], list):
-        raise SchemaLoaderError(f"'join_hints' must be a list for table '{table_name}'.")
-
-    # Column checks
+    # Normalize columns
     cleaned_columns: Dict[str, str] = {}
     for column_name, column_description in normalized["columns"].items():
         if not isinstance(column_name, str):
             raise SchemaLoaderError(
                 f"Column name must be a string in table '{table_name}'."
             )
-        if not isinstance(column_description, str):
-            raise SchemaLoaderError(
-                f"Column description for '{table_name}.{column_name}' must be a string."
-            )
-        cleaned_columns[column_name] = column_description.strip()
+        cleaned_columns[column_name.strip()] = str(column_description).strip()
 
     normalized["columns"] = cleaned_columns
 
-    # Clean lists
-    normalized["primary_keys"] = [str(item).strip() for item in normalized["primary_keys"]]
-    normalized["business_keys"] = [str(item).strip() for item in normalized["business_keys"]]
-    normalized["used_for"] = [str(item).strip() for item in normalized["used_for"]]
-    normalized["join_hints"] = [str(item).strip() for item in normalized["join_hints"]]
+    # Normalize list fields
+    normalized["primary_keys"] = _clean_string_list(normalized.get("primary_keys", []))
+    normalized["business_keys"] = _clean_string_list(normalized.get("business_keys", []))
+    normalized["used_for"] = _clean_string_list(normalized.get("used_for", []))
+    normalized["join_hints"] = _clean_string_list(normalized.get("join_hints", []))
+
+    # Normalize simple strings
+    normalized["domain"] = normalized["domain"].strip()
+    normalized["description"] = normalized["description"].strip()
 
     return normalized
 
@@ -147,41 +154,123 @@ def _normalize_schema_document(schema_doc: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(normalized["tables"], dict):
         raise SchemaLoaderError("'tables' must be an object/dictionary.")
 
-    cleaned_notes = [str(note).strip() for note in normalized["notes"]]
-    normalized["notes"] = cleaned_notes
+    normalized["notes"] = _clean_string_list(normalized["notes"])
 
     cleaned_tables: Dict[str, Dict[str, Any]] = {}
     for table_name, table_data in normalized["tables"].items():
         if not isinstance(table_name, str):
             raise SchemaLoaderError("All table names in schema JSON must be strings.")
-        cleaned_tables[table_name] = _validate_table_metadata(table_name, table_data)
+        cleaned_tables[table_name.strip()] = _validate_table_metadata(table_name.strip(), table_data)
 
     normalized["tables"] = cleaned_tables
     return normalized
 
 
-def load_full_schema_document(schema_path: Optional[str] = None) -> Dict[str, Any]:
+def _build_case_insensitive_table_map(all_tables: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        str(table_name).strip().lower(): table_name
+        for table_name in all_tables.keys()
+        if str(table_name).strip()
+    }
+
+
+def _resolve_requested_table_names(
+    requested_table_names: List[str],
+    all_tables: Dict[str, Any],
+) -> Dict[str, str]:
     """
-    Load and validate the entire schema document, preserving every field.
+    Resolve requested table names to real schema_docs.json names
+    using case-insensitive matching.
 
     Returns:
         {
-            "version": str,
-            "purpose": str,
-            "notes": list[str],
-            "tables": {
-                "table_name": {
-                    "domain": str,
-                    "description": str,
-                    "primary_keys": list[str],
-                    "business_keys": list[str],
-                    "columns": dict[str, str],
-                    "used_for": list[str],
-                    "join_hints": list[str],
-                    ...any additional fields preserved...
-                }
-            }
+            "requested_name": "ActualTableName"
         }
+    """
+    table_map = _build_case_insensitive_table_map(all_tables)
+    resolved: Dict[str, str] = {}
+
+    for raw_name in requested_table_names:
+        clean_name = str(raw_name).strip()
+        if not clean_name:
+            continue
+
+        lower_name = clean_name.lower()
+
+        if clean_name in all_tables:
+            resolved[clean_name] = clean_name
+        elif lower_name in table_map:
+            resolved[clean_name] = table_map[lower_name]
+
+    return resolved
+
+
+def _filter_columns_in_table_metadata(
+    table_metadata: Dict[str, Any],
+    selected_columns: Optional[List[str]] = None,
+    strict_columns: bool = False,
+) -> Dict[str, Any]:
+    """
+    Return a deep-copied table metadata object with only the requested columns preserved.
+
+    If selected_columns is empty/None, keep all columns.
+    """
+    metadata_copy = deepcopy(table_metadata)
+    columns = metadata_copy.get("columns", {})
+
+    if not isinstance(columns, dict):
+        metadata_copy["columns"] = {}
+        return metadata_copy
+
+    if not selected_columns:
+        return metadata_copy
+
+    real_columns_map = {
+        str(column_name).strip().lower(): column_name
+        for column_name in columns.keys()
+    }
+
+    resolved_columns: List[str] = []
+    missing_columns: List[str] = []
+
+    for raw_col in selected_columns:
+        clean_col = str(raw_col).strip()
+        if not clean_col:
+            continue
+
+        if clean_col in columns:
+            resolved_columns.append(clean_col)
+            continue
+
+        lower_col = clean_col.lower()
+        if lower_col in real_columns_map:
+            resolved_columns.append(real_columns_map[lower_col])
+        else:
+            missing_columns.append(clean_col)
+
+    if strict_columns and missing_columns:
+        available = ", ".join(sorted(columns.keys()))
+        missing = ", ".join(missing_columns)
+        raise SchemaLoaderError(
+            f"Requested column(s) not found: {missing}. Available columns: {available}"
+        )
+
+    resolved_columns = list(dict.fromkeys(resolved_columns))
+    metadata_copy["columns"] = {
+        column_name: columns[column_name]
+        for column_name in resolved_columns
+        if column_name in columns
+    }
+
+    return metadata_copy
+
+
+# ------------------------------------------
+# PUBLIC LOADERS
+# ------------------------------------------
+def load_full_schema_document(schema_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load and validate the entire schema document, preserving every field.
     """
     path = Path(schema_path) if schema_path else DEFAULT_SCHEMA_PATH
     raw_data = _read_json_file(path)
@@ -209,23 +298,6 @@ def load_schema(
         strict:
             If True, raise error when any requested table is missing.
             If False, silently ignore missing tables.
-
-    Returns:
-        If include_meta=False:
-            {
-                "login_mast": {...},
-                "emp_leave_setting": {...}
-            }
-
-        If include_meta=True:
-            {
-                "version": "...",
-                "purpose": "...",
-                "notes": [...],
-                "tables": {
-                    ...
-                }
-            }
     """
     schema_doc = load_full_schema_document(schema_path=schema_path)
     all_tables = schema_doc["tables"]
@@ -234,13 +306,13 @@ def load_schema(
         selected_tables = deepcopy(all_tables)
     else:
         selected_tables = {}
-        missing_tables = []
+        requested_names = [str(name).strip() for name in table_names if str(name).strip()]
+        resolved_map = _resolve_requested_table_names(requested_names, all_tables)
 
-        for table_name in table_names:
-            if table_name in all_tables:
-                selected_tables[table_name] = deepcopy(all_tables[table_name])
-            else:
-                missing_tables.append(table_name)
+        missing_tables = [name for name in requested_names if name not in resolved_map]
+
+        for requested_name, real_name in resolved_map.items():
+            selected_tables[real_name] = deepcopy(all_tables[real_name])
 
         if strict and missing_tables:
             available = ", ".join(sorted(all_tables.keys()))
@@ -261,6 +333,44 @@ def load_schema(
     return selected_tables
 
 
+def load_selected_schema(
+    selected_tables: List[str],
+    selected_columns: Optional[Dict[str, List[str]]] = None,
+    schema_path: Optional[str] = None,
+    strict_tables: bool = True,
+    strict_columns: bool = False,
+) -> Dict[str, Any]:
+    """
+    Load schema for selected tables and optionally filter to selected columns.
+
+    Example:
+        load_selected_schema(
+            selected_tables=["login_mast"],
+            selected_columns={"login_mast": ["emp_id", "login_date", "login_time"]}
+        )
+    """
+    base_schema = load_schema(
+        table_names=selected_tables,
+        schema_path=schema_path,
+        include_meta=False,
+        strict=strict_tables,
+    )
+
+    if not selected_columns:
+        return base_schema
+
+    output: Dict[str, Any] = {}
+    for table_name, metadata in base_schema.items():
+        columns_for_table = selected_columns.get(table_name, [])
+        output[table_name] = _filter_columns_in_table_metadata(
+            table_metadata=metadata,
+            selected_columns=columns_for_table,
+            strict_columns=strict_columns,
+        )
+
+    return output
+
+
 def get_table_names(schema_path: Optional[str] = None) -> List[str]:
     """
     Return all available table names from schema_docs.json.
@@ -279,7 +389,7 @@ def get_table_schema(table_name: str, schema_path: Optional[str] = None) -> Dict
         include_meta=False,
         strict=True,
     )
-    return schema[table_name]
+    return next(iter(schema.values()))
 
 
 def get_table_columns(table_name: str, schema_path: Optional[str] = None) -> Dict[str, str]:
@@ -326,6 +436,7 @@ def search_tables_by_use_case(use_case: str, schema_path: Optional[str] = None) 
 
 def build_llm_schema_context(
     table_names: List[str],
+    selected_columns: Optional[Dict[str, List[str]]] = None,
     schema_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -339,26 +450,13 @@ def build_llm_schema_context(
     - use cases
 
     rather than raw file metadata only.
-
-    Returns:
-        {
-            "tables": {
-                "login_mast": {
-                    "description": "...",
-                    "columns": {...},
-                    "primary_keys": [...],
-                    "business_keys": [...],
-                    "join_hints": [...],
-                    "used_for": [...]
-                }
-            }
-        }
     """
-    selected_tables = load_schema(
-        table_names=table_names,
+    selected_tables = load_selected_schema(
+        selected_tables=table_names,
+        selected_columns=selected_columns,
         schema_path=schema_path,
-        include_meta=False,
-        strict=True,
+        strict_tables=True,
+        strict_columns=False,
     )
 
     llm_context = {"tables": {}}

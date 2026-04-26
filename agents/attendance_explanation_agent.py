@@ -16,12 +16,42 @@ from llm.provider import get_llm
 def _safe_to_str(value: Any) -> str:
     if value is None:
         return "null"
+
     if isinstance(value, (dict, list, tuple)):
         try:
             return json.dumps(value, default=str, ensure_ascii=False)
         except Exception:
             return str(value)
+
     return str(value)
+
+
+def _extract_text_from_response(response: Any) -> str:
+    if response is None:
+        return ""
+
+    if isinstance(response, str):
+        return response.strip()
+
+    content = getattr(response, "content", None)
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text_value = item.get("text")
+                if text_value is not None:
+                    parts.append(str(text_value))
+            else:
+                parts.append(str(item))
+        return " ".join(parts).strip()
+
+    return str(response).strip()
 
 
 def _normalize_db_result(result: Any) -> Dict[str, Any]:
@@ -94,7 +124,6 @@ def _rows_to_records(rows: List[Any], columns: List[str]) -> List[Dict[str, Any]
                 records.append(record)
         return records
 
-    # Fallback for unknown row shape
     for idx, row in enumerate(rows, start=1):
         records.append({"row_number": idx, "value": row})
 
@@ -117,6 +146,8 @@ def _select_relevant_fields(record: Dict[str, Any]) -> Dict[str, Any]:
         "shift_outtime",
         "leave_status",
         "leave_remark",
+        "Leave_type",
+        "LeaveCategory",
         "reason",
         "leav_type",
         "leave_day",
@@ -127,6 +158,7 @@ def _select_relevant_fields(record: Dict[str, Any]) -> Dict[str, Any]:
         "LOP",
         "Permission",
         "holidays",
+        "weekoff",
         "weekOffName",
         "holidayTypeName",
         "HODComments",
@@ -134,6 +166,9 @@ def _select_relevant_fields(record: Dict[str, Any]) -> Dict[str, Any]:
         "previousStatus",
         "previousMarkedBy",
         "isApproval",
+        "actualWorkingMinutes",
+        "shiftWorkingMinutes",
+        "isLateComing",
     ]
 
     selected: Dict[str, Any] = {}
@@ -171,7 +206,7 @@ def _build_evidence_block(records: List[Dict[str, Any]], max_records: int = 5) -
     return "\n".join(lines)
 
 
-def _build_rule_block(context: Dict[str, Any], max_rules: int = 20) -> str:
+def _build_rule_block(context: Dict[str, Any], max_rules: int = 25) -> str:
     rules = context.get("rules", [])
     if not isinstance(rules, list) or not rules:
         return "No business rules available."
@@ -207,6 +242,33 @@ def _build_query_analysis_block(context: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_business_focus_block(context: Dict[str, Any]) -> str:
+    business_focus = context.get("business_focus", [])
+    if not isinstance(business_focus, list) or not business_focus:
+        return "No business focus available."
+
+    return "\n".join(f"- {str(item).strip()}" for item in business_focus if str(item).strip())
+
+
+def _build_query_guidance_block(context: Dict[str, Any]) -> str:
+    query_guidance = context.get("query_guidance", [])
+    if not isinstance(query_guidance, list) or not query_guidance:
+        return "No query guidance available."
+
+    return "\n".join(f"- {str(item).strip()}" for item in query_guidance if str(item).strip())
+
+
+def _build_result_preference_block(context: Dict[str, Any]) -> str:
+    result_preferences = context.get("result_preferences", {})
+    if not isinstance(result_preferences, dict) or not result_preferences:
+        return "No result preferences available."
+
+    lines = []
+    for key, value in result_preferences.items():
+        lines.append(f"- {key}: {_safe_to_str(value)}")
+    return "\n".join(lines)
+
+
 def _build_explanation_prompt(
     query: str,
     result: Dict[str, Any],
@@ -230,6 +292,9 @@ def _build_explanation_prompt(
     tables_block = _build_table_block(context)
     join_block = _build_join_hint_block(context)
     analysis_block = _build_query_analysis_block(context)
+    focus_block = _build_business_focus_block(context)
+    guidance_block = _build_query_guidance_block(context)
+    preferences_block = _build_result_preference_block(context)
 
     prompt = f"""
 You are an expert HRMS attendance and leave reasoning analyst.
@@ -246,6 +311,15 @@ SELECTED TABLES:
 QUERY ANALYSIS:
 {analysis_block}
 
+BUSINESS FOCUS:
+{focus_block}
+
+QUERY GUIDANCE:
+{guidance_block}
+
+RESULT PREFERENCES:
+{preferences_block}
+
 BUSINESS RULES:
 {rules_block}
 
@@ -259,13 +333,13 @@ INSTRUCTIONS:
 1. Answer the user's actual question directly.
 2. Use the evidence first, then apply business rules carefully.
 3. If the question is a "why" question, explain the most likely supported reason.
-4. If leave, holiday, weekoff, shift timing, permission, or LOP could affect the answer, mention them only when supported by evidence.
+4. Mention leave, holiday, weekoff, shift timing, permission, LOP, or monthly summary only when supported by evidence.
 5. If records are conflicting, mention the conflict instead of forcing certainty.
 6. If evidence is insufficient, say what is missing.
 7. Keep the answer concise but meaningful.
 8. Do not output SQL.
 9. Do not output JSON.
-10. Do not mention internal system design.
+10. Do not mention internal system design, prompts, models, or pipeline steps.
 
 OUTPUT STYLE:
 - Human-readable
@@ -291,34 +365,41 @@ def _fallback_explanation(query: str, result: Dict[str, Any], context: Dict[str,
     first = records[0]
     pieces: List[str] = []
 
-    if "leave_status" in first:
-        pieces.append(f"leave_status={_safe_to_str(first.get('leave_status'))}")
-    if "leave_remark" in first and first.get("leave_remark"):
-        pieces.append(f"leave_remark={_safe_to_str(first.get('leave_remark'))}")
-    if "login_time" in first:
-        pieces.append(f"login_time={_safe_to_str(first.get('login_time'))}")
-    if "logoff_time" in first:
-        pieces.append(f"logoff_time={_safe_to_str(first.get('logoff_time'))}")
-    if "shift_intime" in first:
-        pieces.append(f"shift_intime={_safe_to_str(first.get('shift_intime'))}")
-    if "shift_outtime" in first:
-        pieces.append(f"shift_outtime={_safe_to_str(first.get('shift_outtime'))}")
-    if "LopCount" in first:
-        pieces.append(f"LopCount={_safe_to_str(first.get('LopCount'))}")
-    if "LOP" in first:
-        pieces.append(f"LOP={_safe_to_str(first.get('LOP'))}")
-    if "Permission" in first:
-        pieces.append(f"Permission={_safe_to_str(first.get('Permission'))}")
-    if "holidays" in first:
-        pieces.append(f"holidays={_safe_to_str(first.get('holidays'))}")
+    for field in [
+        "leave_status",
+        "leave_remark",
+        "Leave_type",
+        "LeaveCategory",
+        "login_time",
+        "logoff_time",
+        "shift_intime",
+        "shift_outtime",
+        "isLateComing",
+        "actualWorkingMinutes",
+        "shiftWorkingMinutes",
+        "LopCount",
+        "EmpLop",
+        "LOP",
+        "Permission",
+        "holidays",
+        "leave_day",
+        "manager_appr",
+        "hr_appr",
+    ]:
+        if field in first and first.get(field) not in (None, ""):
+            pieces.append(f"{field}={_safe_to_str(first.get(field))}")
 
     if not pieces:
         return (
-            "Relevant records were found, but a detailed explanation could not be generated. "
-            "Please review the returned attendance, leave, and shift evidence."
+            f"Relevant records were found for '{query}', but a detailed explanation "
+            "could not be generated from the available evidence."
         )
 
-    return f"Based on the available evidence for '{query}', the key factors are: " + ", ".join(pieces) + "."
+    return (
+        f"Based on the available evidence for '{query}', the key factors are: "
+        + ", ".join(pieces)
+        + "."
+    )
 
 
 # ------------------------------------------
@@ -351,7 +432,7 @@ def reason_over_result(
     if normalized_result.get("row_count", 0) == 0:
         return "Data not found"
 
-    explanation_llm = llm or get_llm("general")
+    explanation_llm = llm or get_llm("explanation")
 
     prompt = _build_explanation_prompt(
         query=clean_query,
@@ -365,15 +446,7 @@ def reason_over_result(
 
         if hasattr(explanation_llm, "invoke"):
             response = explanation_llm.invoke(prompt)
-
-            if isinstance(response, str):
-                answer = response.strip()
-            else:
-                content = getattr(response, "content", "")
-                if isinstance(content, list):
-                    answer = " ".join(str(item) for item in content).strip()
-                else:
-                    answer = str(content).strip()
+            answer = _extract_text_from_response(response)
 
             if answer:
                 return answer

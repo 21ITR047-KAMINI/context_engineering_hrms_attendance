@@ -50,6 +50,7 @@ def _extract_join_hints_from_schema(schema: Dict[str, Any]) -> List[str]:
     for _, table_meta in schema.items():
         if not isinstance(table_meta, dict):
             continue
+
         hints = table_meta.get("join_hints", [])
         if isinstance(hints, list):
             join_hints.extend(str(hint).strip() for hint in hints if str(hint).strip())
@@ -63,11 +64,28 @@ def _extract_domains_from_schema(schema: Dict[str, Any]) -> List[str]:
     for _, table_meta in schema.items():
         if not isinstance(table_meta, dict):
             continue
+
         domain = str(table_meta.get("domain", "")).strip()
         if domain:
             domains.append(domain)
 
     return _dedupe_keep_order(domains)
+
+
+def _extract_selected_columns(schema: Dict[str, Any]) -> Dict[str, List[str]]:
+    selected_columns: Dict[str, List[str]] = {}
+
+    for table_name, table_meta in schema.items():
+        if not isinstance(table_meta, dict):
+            continue
+
+        columns = table_meta.get("columns", {})
+        if isinstance(columns, dict):
+            selected_columns[table_name] = list(columns.keys())
+        else:
+            selected_columns[table_name] = []
+
+    return selected_columns
 
 
 def _extract_table_summaries(schema: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -93,25 +111,89 @@ def _extract_table_summaries(schema: Dict[str, Any]) -> Dict[str, Dict[str, Any]
     return summaries
 
 
-def _build_business_focus(intent: str, tables: List[str]) -> List[str]:
+def _build_query_analysis(query: str, intent: str) -> Dict[str, Any]:
     """
-    High-level business focus areas inferred from intent + selected tables.
+    Lightweight structured analysis of the user query.
+    """
+    query_lower = (query or "").strip().lower()
+
+    is_why_question = any(
+        token in query_lower
+        for token in ["why", "reason", "explain", "how come", "what caused"]
+    )
+
+    is_policy_question = any(
+        token in query_lower
+        for token in ["policy", "rule", "allowed", "eligibility", "limit"]
+    )
+
+    is_lookup_question = not (is_why_question or is_policy_question)
+
+    keywords: List[str] = []
+    tracked_keywords = [
+        "attendance",
+        "login",
+        "logout",
+        "logoff",
+        "leave",
+        "shift",
+        "holiday",
+        "weekoff",
+        "week off",
+        "late",
+        "absent",
+        "half day",
+        "half-day",
+        "lop",
+        "permission",
+        "compoff",
+        "statutory",
+        "policy",
+        "rule",
+        "hours",
+        "minutes",
+        "worked",
+        "working",
+        "count",
+        "total",
+        "summary",
+        "month",
+        "monthly",
+    ]
+
+    for token in tracked_keywords:
+        if token in query_lower:
+            keywords.append(token)
+
+    return {
+        "intent": intent,
+        "is_why_question": is_why_question,
+        "is_policy_question": is_policy_question,
+        "is_lookup_question": is_lookup_question,
+        "keywords": _dedupe_keep_order(keywords),
+    }
+
+
+def _build_business_focus(intent: str, tables: List[str], query_analysis: Dict[str, Any]) -> List[str]:
+    """
+    High-level business focus areas inferred from intent + selected tables + query shape.
     This helps prompt builders frame what the model should care about.
     """
     focus: List[str] = []
+    keywords = query_analysis.get("keywords", [])
 
     if intent == "attendance":
         focus.extend([
             "attendance event lookup",
             "login/logout interpretation",
-            "shift-aware attendance understanding",
+            "worked-time computation",
         ])
 
     elif intent == "leave":
         focus.extend([
-            "leave status and workflow understanding",
+            "processed leave/day-status interpretation",
             "employee leave application details",
-            "day-wise leave validation",
+            "date-wise leave validation",
         ])
 
     elif intent == "attendance_explanation":
@@ -129,7 +211,21 @@ def _build_business_focus(intent: str, tables: List[str]) -> List[str]:
             "employee-specific exception handling",
         ])
 
-    # Table-driven focus
+    if "hours" in keywords or "minutes" in keywords:
+        focus.append("worked time calculation")
+
+    if "lop" in keywords:
+        focus.append("loss of pay reasoning")
+
+    if "permission" in keywords:
+        focus.append("permission reasoning")
+
+    if "half day" in keywords or "half-day" in keywords:
+        focus.append("half-day interpretation")
+
+    if "month" in keywords or "monthly" in keywords or "summary" in keywords:
+        focus.append("monthly summary analysis")
+
     table_focus_map = {
         "login_mast": "attendance facts",
         "emp_leave_setting": "processed leave outcome",
@@ -158,55 +254,56 @@ def _build_business_focus(intent: str, tables: List[str]) -> List[str]:
     return _dedupe_keep_order(focus)
 
 
-def _build_query_analysis(query: str, intent: str) -> Dict[str, Any]:
+def _build_query_guidance(
+    intent: str,
+    tables: List[str],
+    query_analysis: Dict[str, Any],
+) -> List[str]:
     """
-    Lightweight structured analysis of the user query.
+    Build practical guidance for the prompt builder / LLM context.
+    These are not business rules from the domain file, but contextual guidance
+    derived from the selected schema and query shape.
     """
-    query_lower = (query or "").strip().lower()
+    guidance: List[str] = []
+    keywords = query_analysis.get("keywords", [])
+    table_set = set(tables)
 
-    is_why_question = any(
-        token in query_lower
-        for token in ["why", "reason", "explain", "how come", "what caused"]
-    )
+    guidance.append("Use the minimum number of selected tables required to answer the question correctly.")
+    guidance.append("Use ONLY the selected schema tables and columns; never invent or rename schema elements.")
+    guidance.append("Do not change user-provided literal filters such as dates, employee IDs, or numeric IDs.")
 
-    is_policy_question = any(
-        token in query_lower
-        for token in ["policy", "rule", "allowed", "eligibility", "limit"]
-    )
+    if len(tables) == 1:
+        guidance.append("Only one table is selected, so do not create joins.")
+        guidance.append("Single-table-first strategy applies: avoid JOIN unless explicitly required by selected schema.")
 
-    is_lookup_question = not (is_why_question or is_policy_question)
+    if "login_mast" in table_set and "login" in keywords and ("logout" in keywords or "logoff" in keywords):
+        guidance.append("This is a login/logout style query, so login_mast is likely sufficient.")
 
-    keywords = []
-    tracked_keywords = [
-        "attendance",
-        "login",
-        "logout",
-        "leave",
-        "shift",
-        "holiday",
-        "weekoff",
-        "late",
-        "absent",
-        "half day",
-        "lop",
-        "permission",
-        "compoff",
-        "statutory",
-        "policy",
-        "rule",
-    ]
+    if "login_mast" in table_set and ("hours" in keywords or "minutes" in keywords):
+        guidance.append("For worked-hours or worked-minutes queries, calculate from login_time and logoff_time in login_mast unless a precomputed operational field is explicitly requested.")
 
-    for token in tracked_keywords:
-        if token in query_lower:
-            keywords.append(token)
+    if "emp_leave_setting" in table_set and "leave" in keywords:
+        guidance.append("emp_leave_setting is the primary processed leave/day-status layer for simple leave queries.")
 
-    return {
-        "intent": intent,
-        "is_why_question": is_why_question,
-        "is_policy_question": is_policy_question,
-        "is_lookup_question": is_lookup_question,
-        "keywords": _dedupe_keep_order(keywords),
-    }
+    if "Leave_detail" in table_set:
+        guidance.append("Leave_detail should be used for leave type, reason, application, and time-range details.")
+
+    if "leave_dates" in table_set:
+        guidance.append("leave_dates should be used only for day-wise leave coverage, half-day value, or approval workflow details.")
+
+    if "cl_detail" in table_set:
+        guidance.append("cl_detail is best for monthly totals, balances, permissions, holidays, and LOP summaries, not raw punch facts.")
+
+    if "shift_details" in table_set:
+        guidance.append("shift_details is useful only when expected timing, shift hours, weekoff, or lateness must be interpreted.")
+
+    if "attendance_explanation" == intent:
+        guidance.append("This is an explanation query, so reconcile processed leave/day-status, raw attendance facts, and supporting shift or summary evidence before concluding.")
+
+    if "policy" == intent:
+        guidance.append("This is a policy query, so prefer policy/reference interpretation over transactional proof.")
+
+    return _dedupe_keep_order(guidance)
 
 
 def _build_retrieval_summary(
@@ -214,6 +311,7 @@ def _build_retrieval_summary(
     schema: Dict[str, Any],
     rules: List[str],
     join_hints: List[str],
+    selected_columns: Dict[str, List[str]],
 ) -> Dict[str, Any]:
     """
     Compact retrieval metadata for logging/debugging/UI use.
@@ -221,14 +319,14 @@ def _build_retrieval_summary(
     total_columns = 0
     domains = _extract_domains_from_schema(schema)
 
-    for _, meta in schema.items():
-        if isinstance(meta, dict):
-            total_columns += len(meta.get("columns", {}) or {})
+    for table_name, columns in selected_columns.items():
+        total_columns += len(columns)
 
     return {
         "selected_table_count": len(tables),
         "selected_tables": deepcopy(tables),
         "selected_domains": domains,
+        "selected_columns": deepcopy(selected_columns),
         "total_selected_columns": total_columns,
         "rule_count": len(rules),
         "join_hint_count": len(join_hints),
@@ -237,8 +335,8 @@ def _build_retrieval_summary(
 
 def _build_llm_schema_block(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build an LLM-friendly schema block, preserving all relevant metadata
-    needed by prompt builders.
+    Build an LLM-friendly schema block, preserving only relevant metadata
+    for prompt builders.
     """
     tables_block: Dict[str, Any] = {}
 
@@ -256,8 +354,18 @@ def _build_llm_schema_block(schema: Dict[str, Any]) -> Dict[str, Any]:
             "join_hints": deepcopy(meta.get("join_hints", [])),
         }
 
+    return {"tables": tables_block}
+
+
+def _build_result_preferences(intent: str, query_analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Lightweight hinting for downstream response formatting.
+    """
+    keywords = query_analysis.get("keywords", [])
     return {
-        "tables": tables_block
+        "prefer_reasoning": bool(query_analysis.get("is_why_question")) or intent in {"attendance_explanation", "policy"},
+        "prefer_tabular": intent in {"attendance", "leave"} and not query_analysis.get("is_why_question", False),
+        "is_aggregate": any(token in keywords for token in ["count", "total", "summary", "month", "monthly", "hours", "minutes"]),
     }
 
 
@@ -278,33 +386,26 @@ def build_context(
     - query
     - intent
     - selected tables
-    - full selected schema metadata
+    - selected schema metadata (already column-filtered)
     - business rules
     - join hints
-    - lightweight query analysis
-    - compact retrieval summary
-
-    Output shape:
-    {
-        "query": "...",
-        "intent": "attendance_explanation",
-        "tables": [...],
-        "schema": {...},
-        "rules": [...],
-        "join_hints": [...],
-        "table_summaries": {...},
-        "query_analysis": {...},
-        "business_focus": [...],
-        "retrieval_summary": {...},
-        "llm_context": {...}
-    }
+    - query analysis
+    - business focus
+    - retrieval summary
+    - query guidance
+    - result preferences
+    - llm_context
     """
     clean_query = (query or "").strip()
     safe_intent = _normalize_intent(intent)
     schema_copy = _copy_schema(schema)
 
     selected_tables = list(schema_copy.keys())
-    rules_clean = _dedupe_keep_order([str(rule).strip() for rule in rules if str(rule).strip()])
+    selected_columns = _extract_selected_columns(schema_copy)
+
+    rules_clean = _dedupe_keep_order(
+        [str(rule).strip() for rule in rules if str(rule).strip()]
+    )
 
     schema_join_hints = _extract_join_hints_from_schema(schema_copy)
     extra_join_hints = _dedupe_keep_order(
@@ -314,34 +415,44 @@ def build_context(
 
     table_summaries = _extract_table_summaries(schema_copy)
     query_analysis = _build_query_analysis(clean_query, safe_intent)
-    business_focus = _build_business_focus(safe_intent, selected_tables)
+    business_focus = _build_business_focus(safe_intent, selected_tables, query_analysis)
+    query_guidance = _build_query_guidance(safe_intent, selected_tables, query_analysis)
     retrieval_summary = _build_retrieval_summary(
         tables=selected_tables,
         schema=schema_copy,
         rules=rules_clean,
         join_hints=join_hints,
+        selected_columns=selected_columns,
     )
     llm_schema_block = _build_llm_schema_block(schema_copy)
+    result_preferences = _build_result_preferences(safe_intent, query_analysis)
 
     context = {
         "query": clean_query,
         "intent": safe_intent,
         "tables": deepcopy(selected_tables),
+        "selected_columns": deepcopy(selected_columns),
         "schema": schema_copy,
         "rules": deepcopy(rules_clean),
         "join_hints": deepcopy(join_hints),
         "table_summaries": table_summaries,
         "query_analysis": query_analysis,
         "business_focus": business_focus,
+        "query_guidance": query_guidance,
+        "result_preferences": result_preferences,
         "retrieval_summary": retrieval_summary,
         "llm_context": {
             "query": clean_query,
             "intent": safe_intent,
             "tables": deepcopy(selected_tables),
+            "selected_columns": deepcopy(selected_columns),
             "schema": llm_schema_block["tables"],
             "rules": deepcopy(rules_clean),
             "join_hints": deepcopy(join_hints),
             "business_focus": deepcopy(business_focus),
+            "query_analysis": deepcopy(query_analysis),
+            "query_guidance": deepcopy(query_guidance),
+            "result_preferences": deepcopy(result_preferences),
         },
     }
 

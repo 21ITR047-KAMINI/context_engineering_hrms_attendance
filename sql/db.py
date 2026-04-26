@@ -42,6 +42,6 @@ def get_database():
             "trnCandidateHolidayMapping",
             "cl_detail"
         ],
-        sample_rows_in_table_info=1,
+        sample_rows_in_table_info=2,
         view_support=True
     )

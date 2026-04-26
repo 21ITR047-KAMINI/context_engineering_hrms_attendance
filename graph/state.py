@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 
@@ -14,12 +16,19 @@ ModeType = Literal[
     "reasoning",
 ]
 
+ComplexityType = Literal[
+    "simple",
+    "aggregate",
+    "status_interpretation",
+    "explanation",
+]
+
 
 class DBResult(TypedDict, total=False):
     """
     Normalized database execution result.
     """
-    rows: List[Dict[str, Any]]
+    rows: List[Any]
     columns: List[str]
     error: Optional[str]
     row_count: int
@@ -44,6 +53,7 @@ class AgentState(TypedDict, total=False):
     query: str
     intent: IntentType
     mode: ModeType
+    complexity: ComplexityType
 
     # ----------------------------
     # Schema / context engineering
@@ -83,6 +93,7 @@ def create_initial_state(query: str, max_retries: int = 2) -> AgentState:
         query=query.strip(),
         intent="irrelevant",
         mode="lookup",
+        complexity="simple",
         selected_tables=[],
         schema_context={},
         business_context=[],

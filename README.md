@@ -49,8 +49,8 @@ Create a `.env` file in the project root with:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL_SQL=<your-sql-model-name>
-OLLAMA_MODEL_Exp=<your-explanation-model-name>
+OLLAMA_MODEL_SQL=qwen2.5-coder:7b
+OLLAMA_MODEL_Exp=llama3.1:8b
 
 DB_SERVER=<sql-server-host>
 DB_NAME=<database-name>

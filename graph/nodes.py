@@ -4,28 +4,25 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from graph.state import AgentState
 
 from agents.router_agent import router_agent
 from agents.attendance_explanation_agent import reason_over_result
+from constants import FALLBACK_QUERY_ERROR_MESSAGE
 
-from rag.schema_selector import select_relevant_schema
-from rag.schema_loader import load_schema
+from rag.schema_selector import select_schema_bundle
 from rag.business_rules import get_rules
 from rag.context_builder import build_context
 
-from llm.prompt_builder import (
-    build_sql_prompt,
-    build_sql_correction_prompt,
-)
-from sql.sql_generator import generate_sql
+from sql.sql_generator import generate_sql, correct_sql
 from sql.sql_validator import validate_sql
 from sql.result_processor import process_result
 
-from sql.db_schema import load_db_schema
-from tools.sql_tools import execute_sql
+from sql.db_schema import get_db_schema
+from tools.sql_tools import execute_sql, fetch_table_sample
+from tools.result_tool import format_table_view
 
 
 # ------------------------------------------
@@ -41,10 +38,6 @@ VALID_INTENTS = {
 
 
 def _normalize_router_output(router_output: Any) -> str:
-    """
-    Normalize router output to one of:
-    attendance, leave, attendance_explanation, policy, irrelevant
-    """
     if isinstance(router_output, str):
         intent = router_output.strip().lower()
         return intent if intent in VALID_INTENTS else "irrelevant"
@@ -62,99 +55,55 @@ def _normalize_router_output(router_output: Any) -> str:
     return "irrelevant"
 
 
-def _infer_mode(intent: str) -> str:
-    """
-    Decide response mode.
-    """
+def _infer_mode(intent: str, query: str) -> str:
+    query_lower = (query or "").strip().lower()
+
     if intent in {"attendance_explanation", "policy"}:
         return "reasoning"
+
+    if any(x in query_lower for x in ["why", "reason", "explain"]):
+        return "reasoning"
+
     return "lookup"
 
 
 def _normalize_db_result(result: Any) -> Dict[str, Any]:
-    """
-    Normalize DB result to a predictable structure.
-    """
     normalized = {
-        "rows": [],
-        "columns": [],
-        "error": None,
-        "row_count": 0,
+        "rows": result.get("rows", []) if isinstance(result, dict) else [],
+        "columns": result.get("columns", []) if isinstance(result, dict) else [],
+        "error": result.get("error") if isinstance(result, dict) else None,
+        "row_count": len(result.get("rows", [])) if isinstance(result, dict) else 0,
     }
-
-    if result is None:
-        normalized["error"] = "No result returned from database execution."
-        return normalized
-
-    if isinstance(result, dict):
-        rows = result.get("rows", [])
-        columns = result.get("columns", [])
-        error = result.get("error")
-
-        if rows is None:
-            rows = []
-        if columns is None:
-            columns = []
-
-        normalized["rows"] = rows
-        normalized["columns"] = columns
-        normalized["error"] = error
-        normalized["row_count"] = len(rows) if isinstance(rows, list) else 0
-        return normalized
-
-    normalized["error"] = f"Unexpected DB result format: {type(result).__name__}"
     return normalized
 
 
 def _safe_get_available_schema() -> Dict[str, Any]:
-    """
-    Load full DB schema catalog.
-    Used as an allowlist so selector only returns real DB tables.
-    """
     try:
-        schema = load_db_schema()
+        schema = get_db_schema()
+        print("[DB_SCHEMA] Loaded usable DB schema tables:", list(schema.keys()) if isinstance(schema, dict) else [])
         return schema if isinstance(schema, dict) else {}
-    except Exception:
+    except Exception as e:
+        print("[DB_SCHEMA ERROR]:", str(e))
         return {}
-
-
-def _clear_errors_for_retry() -> Dict[str, Any]:
-    """
-    Clear retry-related errors before regenerating SQL.
-    """
-    return {
-        "validation_error": "",
-        "db_error": "",
-    }
-
-
-def _extract_llm_context(structured_context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    The new RAG context_builder returns a rich structured dictionary.
-    Prompt builders usually need the nested llm_context block.
-    """
-    if not isinstance(structured_context, dict):
-        return {}
-
-    llm_context = structured_context.get("llm_context", {})
-    if isinstance(llm_context, dict) and llm_context:
-        return llm_context
-
-    return structured_context
 
 
 # ------------------------------------------
 # ROUTER NODE
 # ------------------------------------------
 def route_query_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Classify the query intent and infer response mode.
-    """
     query = state.get("query", "").strip()
+
+    print("\n=== NODE: route_query ===")
+    print("[INPUT QUERY]:", query)
 
     router_output = router_agent(query)
     intent = _normalize_router_output(router_output)
-    mode = _infer_mode(intent)
+    mode = _infer_mode(intent, query)
+
+    print("[ROUTE NODE OUTPUT] intent:", intent)
+    print("[ROUTE NODE OUTPUT] mode:", mode)
+    print("[ROUTE NODE OUTPUT] retry_count:", state.get("retry_count", 0))
+    print("[ROUTE NODE OUTPUT] max_retries:", state.get("max_retries", 2))
 
     return {
         "intent": intent,
@@ -168,33 +117,33 @@ def route_query_node(state: AgentState) -> Dict[str, Any]:
 # SCHEMA SELECTION NODE
 # ------------------------------------------
 def schema_selection_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Select relevant tables dynamically using the new RAG selector,
-    then load full selected schema metadata from schema_docs.json.
-    """
     query = state.get("query", "")
     intent = state.get("intent", "irrelevant")
 
-    # DB schema is used as allowlist only.
-    # Selector still uses all metadata present in schema_docs.json.
+    print("\n=== NODE: schema_selection ===")
+    print("[SCHEMA_SELECTION INPUT] query:", query)
+    print("[SCHEMA_SELECTION INPUT] intent:", intent)
+
     available_schema = _safe_get_available_schema()
 
-    selected_tables = select_relevant_schema(
+    schema_bundle = select_schema_bundle(
         query=query,
         intent=intent,
         available_schema=available_schema,
         use_llm=True,
     )
 
-    schema_context = load_schema(
-        table_names=selected_tables,
-        include_meta=False,
-        strict=True,
-    )
+    selected_tables = schema_bundle.get("selected_tables", [])
+    selected_schema = schema_bundle.get("selected_schema", {})
+    selected_columns = schema_bundle.get("selected_columns", {})
+
+    print("[SCHEMA_SELECTION OUTPUT] selected_tables:", selected_tables)
+    print("[SCHEMA_SELECTION OUTPUT] selected_columns:", selected_columns)
+    print("[SCHEMA_SELECTION OUTPUT] selected_schema_tables:", list(selected_schema.keys()))
 
     return {
         "selected_tables": selected_tables,
-        "schema_context": schema_context,
+        "schema_context": selected_schema,
     }
 
 
@@ -202,23 +151,16 @@ def schema_selection_node(state: AgentState) -> Dict[str, Any]:
 # CONTEXT BUILDER NODE
 # ------------------------------------------
 def context_builder_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Build structured RAG context from:
-    - selected tables
-    - selected schema metadata
-    - business rules
-    - join hints
-    """
     query = state.get("query", "")
     intent = state.get("intent", "irrelevant")
     selected_tables = state.get("selected_tables", [])
     schema_context = state.get("schema_context", {})
 
-    business_context = get_rules(
-        intent=intent,
-        tables=selected_tables,
-        include_policy_json=True,
-    )
+    print("\n=== NODE: context_builder ===")
+    print("[CONTEXT INPUT] selected_tables:", selected_tables)
+    print("[CONTEXT INPUT] schema_context_tables:", list(schema_context.keys()) if isinstance(schema_context, dict) else [])
+
+    business_context = get_rules(intent=intent, tables=selected_tables)
 
     structured_context = build_context(
         query=query,
@@ -226,15 +168,24 @@ def context_builder_node(state: AgentState) -> Dict[str, Any]:
         schema=schema_context,
         rules=business_context,
     )
+    table_samples = {}
 
-    llm_context = _extract_llm_context(structured_context)
-    join_hints = structured_context.get("join_hints", []) if isinstance(structured_context, dict) else []
+    for table in selected_tables:
+        table_samples[table] = fetch_table_sample(table, limit=2)
+    
+    llm_context = structured_context.get("llm_context", structured_context)
+
+    print("[CONTEXT OUTPUT] business_rule_count:", len(business_context))
+    print("[CONTEXT OUTPUT] llm_context_keys:", list(llm_context.keys()) if isinstance(llm_context, dict) else [])
+    print("[CONTEXT OUTPUT] full_context_keys:", list(structured_context.keys()) if isinstance(structured_context, dict) else [])
 
     return {
-        "business_context": business_context,
-        "join_hints": join_hints,
         "llm_context": llm_context,
-        "full_context": structured_context,
+        
+        "full_context": {
+        **structured_context,
+        "table_samples": table_samples,
+    },
     }
 
 
@@ -242,40 +193,63 @@ def context_builder_node(state: AgentState) -> Dict[str, Any]:
 # SQL GENERATION NODE
 # ------------------------------------------
 def sql_generation_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Generate SQL from the LLM-focused RAG context.
-    """
     context = state.get("llm_context", {})
 
-    prompt = build_sql_prompt(context)
-    sql = generate_sql(prompt)
+    print("\n=== NODE: sql_generation ===")
+    print("[SQL_GENERATION INPUT] query:", context.get("query", ""))
+    print("[SQL_GENERATION INPUT] tables:", context.get("tables", []))
+    print("[SQL_GENERATION INPUT] selected_columns:", context.get("selected_columns", {}))
 
-    return {
-        "previous_sql": state.get("sql", ""),
-        "sql": sql,
-        "validation_error": "",
-        "db_error": "",
-    }
+    try:
+        sql = generate_sql(context)
+
+        print("[SQL_GENERATION OUTPUT] sql:\n", sql)
+
+        return {
+            "previous_sql": state.get("sql", ""),
+            "sql": sql,
+            "validation_error": "",
+            "db_error": "",
+        }
+
+    except Exception as e:
+        print("[SQL_GENERATION ERROR]:", str(e))
+        return {
+            "previous_sql": state.get("sql", ""),
+            "sql": state.get("sql", ""),
+            "validation_error": str(e),
+            "db_error": "",
+            "retry_count": state.get("retry_count", 0) + 1,
+        }
 
 
 # ------------------------------------------
 # SQL VALIDATION NODE
 # ------------------------------------------
 def sql_validation_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Validate generated SQL before execution.
-    """
     sql = state.get("sql", "")
+    context = state.get("llm_context", {})
 
-    is_valid, message = validate_sql(sql)
+    print("\n=== NODE: sql_validation ===")
+    print("[SQL_VALIDATION INPUT] sql:\n", sql)
 
-    if is_valid:
+    if not str(sql).strip():
+        error_message = state.get("validation_error", "Generated SQL is empty.")
+        print("[SQL_VALIDATION ERROR]:", error_message)
         return {
-            "validation_error": "",
+            "validation_error": error_message,
         }
 
+    is_valid, message = validate_sql(sql, context)
+
+    print("[SQL_VALIDATION OUTPUT] is_valid:", is_valid)
+    print("[SQL_VALIDATION OUTPUT] message:", message)
+
+    if is_valid:
+        return {"validation_error": ""}
+
     return {
-        "validation_error": message or "SQL validation failed.",
+        "validation_error": message,
         "retry_count": state.get("retry_count", 0) + 1,
     }
 
@@ -284,15 +258,19 @@ def sql_validation_node(state: AgentState) -> Dict[str, Any]:
 # SQL EXECUTION NODE
 # ------------------------------------------
 def sql_execution_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Execute validated SQL and normalize result.
-    """
     sql = state.get("sql", "")
+
+    print("\n=== NODE: sql_execution ===")
+    print("[SQL_EXECUTION INPUT] sql:\n", sql)
 
     raw_result = execute_sql(sql)
     db_result = _normalize_db_result(raw_result)
 
-    if db_result.get("error"):
+    print("[SQL_EXECUTION OUTPUT] row_count:", db_result.get("row_count", 0))
+    print("[SQL_EXECUTION OUTPUT] columns:", db_result.get("columns", []))
+    print("[SQL_EXECUTION OUTPUT] error:", db_result.get("error"))
+
+    if db_result["error"]:
         return {
             "db_error": str(db_result["error"]),
             "db_result": db_result,
@@ -309,128 +287,151 @@ def sql_execution_node(state: AgentState) -> Dict[str, Any]:
 # SQL CORRECTION NODE
 # ------------------------------------------
 def sql_correction_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Regenerate SQL using validation/db error feedback
-    while keeping the same RAG context.
-    """
     context = state.get("llm_context", {})
     previous_sql = state.get("sql", "")
     validation_error = state.get("validation_error", "")
     db_error = state.get("db_error", "")
+    combined_error = validation_error or db_error or "Unknown SQL correction error"
 
-    correction_prompt = build_sql_correction_prompt(
-        context=context,
-        previous_sql=previous_sql,
-        validation_error=validation_error,
-        db_error=db_error,
-    )
+    print("\n=== NODE: sql_correction ===")
+    print("[SQL_CORRECTION INPUT] previous_sql:\n", previous_sql)
+    print("[SQL_CORRECTION INPUT] validation_error:", validation_error)
+    print("[SQL_CORRECTION INPUT] db_error:", db_error)
 
-    corrected_sql = generate_sql(correction_prompt)
+    try:
+        corrected_sql = correct_sql(
+            context=context,
+            previous_sql=previous_sql,
+            error=combined_error,
+        )
 
-    cleared_errors = _clear_errors_for_retry()
-    cleared_errors.update(
-        {
-            "previous_sql": previous_sql,
+        print("[SQL_CORRECTION OUTPUT] corrected_sql:\n", corrected_sql)
+
+        return {
             "sql": corrected_sql,
+            "validation_error": "",
+            "db_error": "",
         }
-    )
-    return cleared_errors
+
+    except Exception as e:
+        print("[SQL_CORRECTION ERROR]:", str(e))
+        return {
+            "validation_error": str(e),
+            "retry_count": state.get("retry_count", 0) + 1,
+        }
 
 
 # ------------------------------------------
-# RESULT REASONING NODE
+# RESULT NODE
 # ------------------------------------------
 def result_reasoning_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Build final user-facing response.
-
-    Modes:
-    - lookup: simple formatting of DB results
-    - reasoning: explanation based on evidence + business rules + RAG context
-    """
-    query = state.get("query", "")
     intent = state.get("intent", "irrelevant")
     mode = state.get("mode", "lookup")
     db_result = state.get("db_result", {})
 
+    print("\n=== NODE: result_reasoning ===")
+    print("[RESULT INPUT] intent:", intent)
+    print("[RESULT INPUT] mode:", mode)
+    print("[RESULT INPUT] db_row_count:", db_result.get("row_count", 0) if isinstance(db_result, dict) else 0)
+
     if intent == "irrelevant":
-        return {
-            "response": "Question is irrelevant, can be processed in future."
+        print("[RESULT OUTPUT] response: fallback message for irrelevant intent")
+        structured = {
+            "explanation": FALLBACK_QUERY_ERROR_MESSAGE,
+            "rows": [],
+            "columns": [],
+            "table_text": "",
+        }
+        return {"response": structured}
+
+    if db_result.get("error") or not db_result.get("rows"):
+        validation_error = (state.get("validation_error") or "").strip()
+        db_error = (state.get("db_error") or "").strip()
+
+        # Always return a structured fallback so the UI can render consistently
+        structured = {
+            "explanation": FALLBACK_QUERY_ERROR_MESSAGE,
+            "rows": [],
+            "columns": [],
+            "table_text": "",
         }
 
-    if db_result.get("error"):
-        if state.get("retry_count", 0) >= state.get("max_retries", 2):
-            return {
-                "response": "Data not found"
-            }
+        if validation_error:
+            print("[RESULT OUTPUT] validation_error:", validation_error)
+            return {"response": structured}
 
-    rows = db_result.get("rows", [])
-    if not rows:
-        return {
-            "response": "Data not found"
-        }
+        if db_error:
+            print("[RESULT OUTPUT] db_error:", db_error)
+            return {"response": structured}
+
+        print("[RESULT OUTPUT] response: fallback message for empty data")
+        return {"response": structured}
 
     if mode == "reasoning":
-        response = reason_over_result(
-            query=query,
+        response_text = reason_over_result(
+            query=state.get("query", ""),
             result=db_result,
-            context=state.get("full_context", state.get("llm_context", {})),
+            context=state.get("full_context", {}),
         )
-        return {
-            "response": response
+        print("[RESULT OUTPUT] reasoning response:\n", response_text)
+
+        structured = {
+            "explanation": response_text,
+            "rows": db_result.get("rows", []),
+            "columns": db_result.get("columns", []),
+            "table_text": format_table_view(db_result.get("rows", []), db_result.get("columns", [])) if db_result.get("rows") and db_result.get("columns") else "",
         }
 
-    response = process_result(db_result, query)
-    return {
-        "response": response
+        return {"response": structured}
+
+    response = process_result(db_result, state.get("query", ""))
+    print("[RESULT OUTPUT] lookup response:\n", response)
+
+    # process_result already returns a structured dict on success,
+    # or a fallback string on error. Normalize to structured form.
+    if isinstance(response, dict):
+        return {"response": response}
+
+    structured = {
+        "explanation": response if isinstance(response, str) else FALLBACK_QUERY_ERROR_MESSAGE,
+        "rows": db_result.get("rows", []),
+        "columns": db_result.get("columns", []),
+        "table_text": format_table_view(db_result.get("rows", []), db_result.get("columns", [])) if db_result.get("rows") and db_result.get("columns") else "",
     }
 
+    return {"response": structured}
+
 
 # ------------------------------------------
-# CONDITIONAL EDGE HELPERS
+# CONDITIONAL EDGES
 # ------------------------------------------
 def should_continue_after_routing(state: AgentState) -> str:
-    """
-    Decide whether to continue pipeline or stop as irrelevant.
-    """
-    if state.get("intent") == "irrelevant":
-        return "irrelevant"
-    return "continue"
+    route = "irrelevant" if state.get("intent") == "irrelevant" else "continue"
+    print("\n[EDGE] should_continue_after_routing ->", route)
+    return route
 
 
 def should_retry_after_validation(state: AgentState) -> str:
-    """
-    After SQL validation:
-    - correction -> validation error and retries available
-    - finish     -> validation error and retries exhausted
-    - execute    -> validation passed
-    """
-    validation_error = state.get("validation_error", "")
+    has_validation_error = bool((state.get("validation_error") or "").strip())
+    if not has_validation_error:
+        print("\n[EDGE] should_retry_after_validation -> execute")
+        return "execute"
+
     retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", 2)
-
-    if validation_error:
-        if retry_count <= max_retries:
-            return "correction"
-        return "finish"
-
-    return "execute"
+    max_retries = state.get("max_retries", 5)
+    route = "correction" if retry_count < max_retries else "finish"
+    print(f"\n[EDGE] should_retry_after_validation -> {route} (retry_count={retry_count}, max_retries={max_retries})")
+    return route
 
 
 def should_retry_after_execution(state: AgentState) -> str:
-    """
-    After SQL execution:
-    - correction -> DB error and retries available
-    - finish     -> DB error and retries exhausted
-    - finish     -> success
-    """
-    db_error = state.get("db_error", "")
-    retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", 2)
-
-    if db_error:
-        if retry_count <= max_retries:
-            return "correction"
+    has_db_error = bool((state.get("db_error") or "").strip())
+    if not has_db_error:
+        print("\n[EDGE] should_retry_after_execution -> finish")
         return "finish"
 
-    return "finish"
+    retry_count = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 5)
+    route = "correction" if retry_count < max_retries else "finish"
+    print(f"\n[EDGE] should_retry_after_execution -> {route} (retry_count={retry_count}, max_retries={max_retries})")
+    return route

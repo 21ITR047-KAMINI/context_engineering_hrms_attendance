@@ -1,34 +1,46 @@
 {
-  "version": "1.1",
-  "purpose": "Minimal HRMS schema metadata for RAG-based table and column retrieval",
+  "version": "2.0",
+  "purpose": "Production-ready HRMS schema metadata for RAG-based table, column, and join retrieval for one-agent dynamic SQL generation and reasoning.",
   "notes": [
-    "This file contains only important tables and required columns for the first implementation.",
     "Keep actual SQL table names exactly as they exist in the database.",
-    "Add relationships and business rules gradually after validating table usage."
+    "This file is the schema knowledge base: table names, column names, descriptions, domains, join hints, and use cases.",
+    "Business interpretation such as W = week off, P = permission, F = full day leave, or no-row = working day belongs in business_rules.py, not here.",
+    "Selectors and prompt builders should prefer the minimum required tables and columns for each query.",
+    "Operational status tables should generally be preferred over descriptive/reference tables for factual user questions."
   ],
   "tables": {
     "login_mast": {
       "domain": "attendance",
-      "description": "Stores employee login and logout attendance records.",
-      "primary_keys": [],
+      "description": "Stores employee login and logout attendance records and attendance-related operational values.",
+      "primary_keys": ["id"],
       "business_keys": ["emp_id", "login_date"],
       "columns": {
+        "id": "Internal identifier for the attendance record",
         "emp_id": "Employee identifier",
         "login_date": "Attendance date",
-        "login_time": "Login time",
-        "logoff_time": "Logout time",
+        "login_time": "Login time or punch-in time",
+        "logoff_time": "Logout time or punch-out time",
         "shift_code": "Shift code for the attendance record",
-        "Logintype": "Type of login"
+        "Logintype": "Type of login such as biometric, WFH, or leave-shift",
+        "isLateComing": "Flag indicating whether the employee was late",
+        "shiftWorkingMinutes": "Expected working minutes for the assigned shift",
+        "actualWorkingMinutes": "Actual worked minutes calculated from punches"
       },
       "used_for": [
         "attendance lookup",
+        "daily attendance lookup",
         "login logout queries",
-        "late attendance reasoning"
+        "worked hours queries",
+        "worked minutes queries",
+        "late attendance reasoning",
+        "punch-based attendance details"
       ],
       "join_hints": [
         "login_mast.emp_id = emp_leave_setting.emp_id",
+        "login_mast.login_date = emp_leave_setting.leave_date",
         "login_mast.shift_code = shift_details.shift_code",
-        "login_mast.emp_id = emp_default_shift.emp_id"
+        "login_mast.emp_id = emp_default_shift.emp_id",
+        "login_mast.emp_id = cl_detail.emp_id"
       ]
     },
 
@@ -44,11 +56,15 @@
         "manager_appr": "Manager approval status",
         "avail_stat": "Availability status",
         "compoff_reas": "Reason for comp-off",
-        "compoff_day": "Comp-off day count"
+        "compoff_day": "Comp-off day count",
+        "HrApproval": "HR approval status",
+        "GmApproval": "General manager approval status",
+        "revokedOn": "Date of revocation if the comp-off was revoked"
       },
       "used_for": [
         "comp-off lookup",
-        "comp-off approval queries"
+        "comp-off approval queries",
+        "comp-off reasoning"
       ],
       "join_hints": [
         "emp_compoff.emp_id = login_mast.emp_id"
@@ -64,7 +80,7 @@
         "emp_id": "Employee identifier",
         "reason": "Reason for leave",
         "leav_type": "Type of leave",
-        "comp_date": "Leave date or start date",
+        "comp_date": "Leave start date or leave date",
         "leave_id": "Leave identifier",
         "frmtime": "Leave start time",
         "totime": "Leave end time",
@@ -72,7 +88,10 @@
       },
       "used_for": [
         "leave details lookup",
-        "leave application reasoning"
+        "leave application reasoning",
+        "leave type lookup",
+        "leave reason lookup",
+        "leave application date lookup"
       ],
       "join_hints": [
         "Leave_detail.leave_id = leave_dates.leave_id",
@@ -94,7 +113,9 @@
       },
       "used_for": [
         "day-wise leave check",
-        "approval workflow lookup"
+        "approval workflow lookup",
+        "half-day interpretation",
+        "date-wise leave validation"
       ],
       "join_hints": [
         "leave_dates.leave_id = Leave_detail.leave_id",
@@ -104,7 +125,7 @@
 
     "emp_leave_setting": {
       "domain": "leave",
-      "description": "Stores processed leave status, remarks, approval, and LOP-related values.",
+      "description": "Stores processed leave status, remarks, approval, and LOP-related values for employee-date level interpretation.",
       "primary_keys": ["leave_id"],
       "business_keys": ["emp_id", "leave_date"],
       "columns": {
@@ -121,31 +142,45 @@
         "LopCount": "Loss of pay count",
         "isEmployeeCL": "Casual leave flag",
         "EmpLop": "Employee loss of pay value",
-        "HODComments": "Head of department comments"
+        "HODComments": "Head of department comments",
+        "Leave_type": "Type of leave if stored in processed leave record",
+        "EmpCL": "Employee casual leave value",
+        "LeaveCategory": "Leave category"
       },
       "used_for": [
         "leave status lookup",
+        "daily leave status lookup",
         "absence explanation",
-        "lop reasoning"
+        "processed leave outcome",
+        "permission interpretation",
+        "week off interpretation",
+        "lop reasoning",
+        "employee-date day status lookup"
       ],
       "join_hints": [
         "emp_leave_setting.emp_id = login_mast.emp_id",
+        "emp_leave_setting.leave_date = login_mast.login_date",
         "emp_leave_setting.leave_id = Leave_detail.leave_id",
-        "emp_leave_setting.leave_id = leave_dates.leave_id"
+        "emp_leave_setting.leave_id = leave_dates.leave_id",
+        "emp_leave_setting.emp_id = cl_detail.emp_id"
       ]
     },
 
     "mstEmployeeStatutoryLeave": {
       "domain": "statutory_leave",
       "description": "Stores employee statutory leave entries.",
-      "primary_keys": [],
+      "primary_keys": ["empStatutoryLeaveId"],
       "business_keys": ["euid", "leaveDate"],
       "columns": {
+        "empStatutoryLeaveId": "Statutory leave record identifier",
         "euid": "Employee unique identifier",
-        "leaveDate": "Statutory leave date"
+        "leaveDate": "Statutory leave date",
+        "LeaveStatus": "Statutory leave status",
+        "LeaveDetails": "Statutory leave details"
       },
       "used_for": [
-        "statutory leave lookup"
+        "statutory leave lookup",
+        "special leave lookup"
       ],
       "join_hints": []
     },
@@ -161,7 +196,8 @@
         "yearWiseDays": "Allowed days per year"
       },
       "used_for": [
-        "statutory leave policy lookup"
+        "statutory leave policy lookup",
+        "statutory leave type reference"
       ],
       "join_hints": []
     },
@@ -181,7 +217,8 @@
       },
       "used_for": [
         "default shift lookup",
-        "attendance shift mapping"
+        "attendance shift mapping",
+        "employee default shift resolution"
       ],
       "join_hints": [
         "emp_default_shift.emp_id = login_mast.emp_id",
@@ -192,9 +229,10 @@
     "trnEmployeeWeeklyShift": {
       "domain": "shift",
       "description": "Stores temporary or weekly shift assignments for employees.",
-      "primary_keys": [],
+      "primary_keys": ["trnID"],
       "business_keys": ["euid", "fromDate", "toDate"],
       "columns": {
+        "trnID": "Weekly shift transaction identifier",
         "euid": "Employee unique identifier",
         "shiftCode": "Assigned weekly shift code",
         "fromDate": "Shift start date",
@@ -202,7 +240,8 @@
       },
       "used_for": [
         "weekly shift lookup",
-        "date-range shift resolution"
+        "date-range shift resolution",
+        "temporary shift override"
       ],
       "join_hints": [
         "trnEmployeeWeeklyShift.shiftCode = shift_details.shift_code"
@@ -211,7 +250,7 @@
 
     "shift_details": {
       "domain": "shift",
-      "description": "Master table for shift timings and rest interval details.",
+      "description": "Master table for shift timings, break values, weekoff, and next-day shift behavior.",
       "primary_keys": ["shift_id"],
       "business_keys": ["shift_code"],
       "columns": {
@@ -220,11 +259,20 @@
         "shift_intime": "Shift start time",
         "shift_outtime": "Shift end time",
         "shift_id": "Shift identifier",
-        "shift_restinterval": "Rest interval during shift"
+        "shift_restinterval": "Rest interval during shift",
+        "BreakTimeMin": "Allowed break time in minutes",
+        "ShiftSeconds": "Total shift duration in seconds",
+        "weekoff": "Configured weekly off information for the shift",
+        "isNextDay": "Flag indicating the shift ends on the next day",
+        "isNightShift": "Flag indicating whether the shift is a night shift"
       },
       "used_for": [
         "shift timing lookup",
-        "attendance explanation"
+        "attendance explanation",
+        "late coming reasoning",
+        "expected working hours reasoning",
+        "week off reasoning",
+        "night shift reasoning"
       ],
       "join_hints": [
         "shift_details.shift_code = login_mast.shift_code",
@@ -268,12 +316,20 @@
         "Permission": "Permission count or value",
         "company_workingdays": "Company working days",
         "cl_Eligible": "Eligible casual leave",
-        "isOBCL": "Opening balance flag"
+        "isOBCL": "Opening balance flag",
+        "dw": "Days worked summary value",
+        "DifferenceDW": "Difference in days worked",
+        "DifferenceCL": "Difference in casual leave",
+        "DifferenceLop": "Difference in loss of pay"
       },
       "used_for": [
         "monthly leave balance lookup",
+        "monthly attendance summary",
         "lop explanation",
-        "permission reasoning"
+        "lop summary",
+        "permission reasoning",
+        "permission totals",
+        "monthly payroll-style attendance reasoning"
       ],
       "join_hints": [
         "cl_detail.emp_id = login_mast.emp_id",
@@ -294,10 +350,12 @@
         "createdDate": "Created date"
       },
       "used_for": [
-        "employee CL policy override lookup"
+        "employee CL policy override lookup",
+        "employee-specific policy reasoning"
       ],
       "join_hints": [
-        "trnExceptionEmployeeCLPolicy.clLeavePolicyNumber = mstCLPolicyRule.policyID"
+        "trnExceptionEmployeeCLPolicy.clLeavePolicyNumber = mstCLPolicyRule.policyID",
+        "trnExceptionEmployeeCLPolicy.currentCategoryID = pay_mst_category.category_id"
       ]
     },
 
@@ -313,7 +371,8 @@
       },
       "used_for": [
         "cl policy lookup",
-        "policy explanation"
+        "policy explanation",
+        "generic casual leave policy reference"
       ],
       "join_hints": [
         "mstCLPolicyRule.policyID = trnExceptionEmployeeCLPolicy.clLeavePolicyNumber"
@@ -330,9 +389,112 @@
         "weekOffName": "Week off name"
       },
       "used_for": [
-        "weekly off reference lookup"
+        "weekly off reference lookup",
+        "week off policy explanation"
       ],
       "join_hints": []
+    },
+
+    "holiday_master": {
+      "domain": "holiday",
+      "description": "Master table of organization holidays.",
+      "primary_keys": ["holi_code"],
+      "business_keys": ["holi_date"],
+      "columns": {
+        "holi_code": "Holiday code",
+        "holi_date": "Holiday date",
+        "holi_type": "Holiday type",
+        "holi_desc": "Holiday description",
+        "holi_leave": "Flag indicating whether the holiday is considered a leave day",
+        "isActive": "Active flag"
+      },
+      "used_for": [
+        "holiday lookup",
+        "holiday applicability reasoning",
+        "absence override reasoning"
+      ],
+      "join_hints": [
+        "holiday_master.holi_date = login_mast.login_date",
+        "holiday_master.holi_date = emp_leave_setting.leave_date"
+      ]
+    },
+
+    "trnCandidateHolidayMapping": {
+      "domain": "holiday",
+      "description": "Maps employees to applicable holiday categories or holiday types.",
+      "primary_keys": ["mappingId"],
+      "business_keys": ["empId", "categoryId", "holidayType"],
+      "columns": {
+        "mappingId": "Holiday mapping identifier",
+        "empId": "Employee identifier",
+        "categoryId": "Holiday category identifier",
+        "holidayType": "Holiday type code",
+        "holidayTypeName": "Holiday type name",
+        "isActive": "Active flag"
+      },
+      "used_for": [
+        "employee holiday mapping lookup",
+        "employee-specific holiday applicability reasoning"
+      ],
+      "join_hints": [
+        "trnCandidateHolidayMapping.empId = login_mast.emp_id",
+        "trnCandidateHolidayMapping.empId = emp_leave_setting.emp_id",
+        "trnCandidateHolidayMapping.categoryId = pay_mst_category.category_id"
+      ]
+    },
+
+    "pay_mst_category": {
+      "domain": "policy",
+      "description": "Defines category-level attendance, leave, holiday, and payroll behavior for employees.",
+      "primary_keys": ["category_id"],
+      "business_keys": ["category"],
+      "columns": {
+        "category_id": "Employee category identifier",
+        "category": "Category name",
+        "LeavePolicyType": "Leave policy type",
+        "clLeavePolicyNumber": "Casual leave policy number",
+        "exception_clLeavePolicyNumber": "Exception casual leave policy number",
+        "WeekOFF": "Week off rule or configuration",
+        "holidayType": "Holiday type rule",
+        "isPermissionApplicable": "Flag indicating whether permission is applicable",
+        "isUILOP": "Flag indicating uninformed LOP behavior",
+        "is_Lop": "Flag indicating LOP handling"
+      },
+      "used_for": [
+        "category policy lookup",
+        "attendance policy reasoning",
+        "leave policy reasoning",
+        "permission policy reasoning",
+        "holiday policy reasoning"
+      ],
+      "join_hints": [
+        "pay_mst_category.category_id = mstRestrictLeaveMarkingCategory.CatId",
+        "pay_mst_category.category_id = trnExceptionEmployeeCLPolicy.currentCategoryID"
+      ]
+    },
+
+    "mstRestrictLeaveMarkingCategory": {
+      "domain": "policy",
+      "description": "Controls category-level restrictions on leave marking.",
+      "primary_keys": ["trnId"],
+      "business_keys": ["CatId", "SalaryDate"],
+      "columns": {
+        "trnId": "Restriction transaction identifier",
+        "CatId": "Category identifier",
+        "CategoryName": "Category name",
+        "SalaryDate": "Salary date",
+        "isRestrict": "Flag indicating whether leave marking is restricted",
+        "isRestrictServiceMarkings": "Flag indicating whether service markings are restricted",
+        "isProcessing": "Processing status flag"
+      },
+      "used_for": [
+        "leave marking restriction lookup",
+        "category-level leave restriction reasoning",
+        "policy restriction explanation"
+      ],
+      "join_hints": [
+        "mstRestrictLeaveMarkingCategory.CatId = pay_mst_category.category_id"
+      ]
     }
   }
 }

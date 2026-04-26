@@ -43,10 +43,14 @@ def _dedupe_keep_order(items: List[str]) -> List[str]:
     return output
 
 
+def _table_set(tables: List[str]) -> set[str]:
+    return {str(table).strip() for table in tables if str(table).strip()}
+
+
 def _load_policy_json(policy_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Load optional department policy JSON.
-    If file is missing, return empty dict without failing the RAG flow.
+    If missing, return empty dict without breaking RAG flow.
     """
     path = Path(policy_path) if policy_path else DEFAULT_POLICY_PATH
 
@@ -62,41 +66,77 @@ def _load_policy_json(policy_path: Optional[str] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _table_set(tables: List[str]) -> set[str]:
-    return {str(table).strip() for table in tables if str(table).strip()}
-
-
 # ------------------------------------------
-# CORE BASE RULES
+# CORE CROSS-CUTTING RULES
 # ------------------------------------------
 COMMON_RULES = [
     "Use database records as the source of truth; do not assume facts not supported by retrieved schema and query results.",
-    "Prefer the minimum business interpretation needed for the question unless the user explicitly asks for explanation or policy reasoning.",
-    "When multiple tables appear to overlap, prefer the table that stores the operational decision or status over a purely descriptive or reference table.",
+    "Prefer the minimum business interpretation required by the question. Do not over-explain unless the user explicitly asks why or asks for a rule/policy explanation.",
+    "Prefer the minimum number of tables required to answer the query correctly.",
+    "Prefer operational status tables over descriptive or reference tables when multiple tables overlap in meaning.",
+    "Do not invent columns, table names, joins, status meanings, or business rules that are not supported by schema metadata and known domain rules.",
+    "If a query can be answered from a single table, avoid joins.",
+    "For SQL generation, assume SQL Server semantics unless explicitly configured otherwise.",
 ]
 
+HRMS_DAY_STATUS_RULES = [
+    "emp_leave_setting is the processed employee-date status layer and should be treated as the primary source for final leave/day-status interpretation.",
+    "For many day-status queries, no row in emp_leave_setting for an employee on a date may indicate a normal working day rather than missing data.",
+    "leave_status code W should be interpreted as Week Off when supported by operational records.",
+    "leave_status code P should be interpreted as Permission when supported by operational records.",
+    "leave_status code F should usually be interpreted as Full Day Leave when supported by operational records.",
+    "leave_remark can contain business meaning that is not fully captured in leave_status alone.",
+    "leave_remark text containing 'No Balance' should be treated as a strong signal of Loss of Pay (LOP) reasoning when relevant.",
+    "login_mast is the attendance event truth for login, logout, and worked-time calculations.",
+]
+
+
+# ------------------------------------------
+# INTENT-SPECIFIC RULES
+# ------------------------------------------
 ATTENDANCE_RULES = [
-    "Attendance queries usually rely first on login_mast for login_date, login_time, logoff_time, shift_code, and login behavior.",
-    "Shift interpretation should use shift_details and employee shift assignment tables when attendance timing needs comparison with expected shift timing.",
-    "Late coming, shift mismatch, missing login, or missing logout should be interpreted only when the underlying shift and attendance records support that conclusion.",
+    "Attendance lookup queries should usually start from login_mast.",
+    "For login/logout, working minutes, working hours, and punch-based attendance queries, login_mast is usually sufficient.",
+    "For simple attendance lookup queries, do not join leave tables unless the user explicitly asks for leave-related interpretation.",
+    "Use emp_id and login_date as the natural business keys for day-level attendance lookup in login_mast.",
+    "When calculating worked time, use login_time and logoff_time from login_mast.",
+    "Worked time calculations should ignore rows where login_time or logoff_time is null unless the user explicitly asks to inspect incomplete punches.",
+    "If login_mast has both login_time and logoff_time, the day can generally be treated as worked unless stronger operational evidence says otherwise.",
+    "If only one of login_time or logoff_time is present, interpret as partial/incomplete punch rather than automatically assuming leave or absence.",
+    "Use shift tables only when the user asks about shift timing, late coming, expected hours, or shift-based explanations.",
 ]
 
 LEAVE_RULES = [
-    "Leave queries usually require emp_leave_setting for processed leave status and Leave_detail or leave_dates for leave request details and date-wise workflow.",
-    "Approved leave on the same employee and date can explain absence or non-working attendance states when supported by records.",
-    "If leave status, leave dates, and leave detail records conflict, prefer the most operationally current status table unless the user explicitly asks about workflow history.",
+    "Leave queries should usually start from emp_leave_setting for final processed leave status.",
+    "Use Leave_detail only when the user asks for leave reason, leave type, apply date, or application-level detail.",
+    "Use leave_dates only when the user asks about day-wise leave coverage, half-day splits, or approval workflow at the date level.",
+    "For basic leave/day-status queries, emp_leave_setting can be sufficient without joining Leave_detail or leave_dates.",
+    "Use leave_id as the primary join key between emp_leave_setting, Leave_detail, and leave_dates when joins are required.",
+    "For employee-date leave lookup, emp_id + leave_date is the important operational lookup pattern.",
+    "If the user asks only whether the employee was on leave on a date, do not over-join.",
+    "If the user asks for exact leave type, reason, or applied date, then Leave_detail becomes relevant.",
+    "If the user asks about approval state on a specific leave date or half-day value, then leave_dates becomes relevant.",
 ]
 
 EXPLANATION_RULES = [
-    "For why-questions, combine attendance evidence, leave evidence, shift timing, and monthly summary evidence when required before concluding the reason.",
-    "Do not claim a causal reason such as absent, half-day, late, or LOP unless supporting evidence exists across the relevant attendance, leave, shift, or monthly summary tables.",
-    "For explanation queries, consider whether leave, statutory leave, holidays, weekly off, shift timing, permissions, or LOP-related monthly summaries change the final interpretation.",
+    "Explanation queries should combine evidence from attendance, processed leave/day status, shift timing, holiday applicability, and monthly summary only when required by the question.",
+    "Do not claim a causal reason such as absent, half-day, late, or LOP unless supporting evidence exists in operational tables.",
+    "For why-questions, prefer evidence in this general order: processed day-status -> attendance punches -> shift expectations -> monthly summaries -> policy/reference data.",
+    "If emp_leave_setting and login_mast disagree, prefer the operational interpretation that best matches the user question, while noting ambiguity when necessary.",
+    "Absence or LOP explanations may require combining emp_leave_setting with cl_detail and optionally shift or holiday context.",
+    "Holiday and weekoff context can override naive absence interpretation if the date is not a normal working day.",
+    "Permission reasoning may require both emp_leave_setting day-status evidence and cl_detail monthly summary evidence.",
+    "Half-day reasoning may require leave_dates.leave_day when the question is explicitly about day fraction or approval split.",
 ]
 
 POLICY_RULES = [
-    "Policy questions should be answered using rule tables, policy metadata, and department policy JSON when available, instead of relying only on transactional records.",
-    "Employee-specific exception tables override generic policy tables when both are available and applicable.",
-    "Reference tables such as mstWeekoffType or mstCLPolicyRule should be used to interpret policy names and counts, not as proof of actual attendance events by themselves.",
+    "Policy questions should prefer policy/reference tables and optional department policy JSON instead of transactional tables alone.",
+    "Employee-specific exception tables should override generic policy tables when both are applicable.",
+    "Reference tables should explain allowed rules and category/policy meaning, not prove that an actual attendance event occurred.",
+    "Use mstCLPolicyRule to interpret generic casual leave policy counts.",
+    "Use trnExceptionEmployeeCLPolicy to interpret employee-specific CL policy overrides.",
+    "Use mstWeekoffType to interpret weekoff naming and type meaning.",
+    "Use pay_mst_category and mstRestrictLeaveMarkingCategory when category-based attendance or leave restrictions are relevant.",
 ]
 
 
@@ -105,69 +145,90 @@ POLICY_RULES = [
 # ------------------------------------------
 TABLE_RULES: Dict[str, List[str]] = {
     "login_mast": [
-        "login_mast is the primary attendance event table for login and logout activity.",
-        "Compare login_time and logoff_time with shift timing only when shift context is available.",
-        "A missing or incomplete login_mast record alone should not automatically be treated as policy violation without checking leave, holiday, or shift context when relevant.",
-    ],
-    "emp_compoff": [
-        "emp_compoff should be used for compensatory off requests, approval state, availability, and comp-off reasoning.",
-        "Comp-off availability and approval must be checked before concluding that comp-off can explain absence or non-working attendance.",
-    ],
-    "Leave_detail": [
-        "Leave_detail stores leave application details such as reason, type, application date, and timing.",
-        "Use Leave_detail when the user asks about leave reason, type, applied date, or leave duration details.",
-    ],
-    "leave_dates": [
-        "leave_dates provides day-wise leave entries and approval workflow at the date level.",
-        "Use leave_dates when validating whether a specific date was covered by leave and how that date was approved.",
+        "login_mast is the primary attendance fact table for employee login/logout activity.",
+        "Key business fields in login_mast include emp_id, login_date, login_time, logoff_time, shift_code, and Logintype.",
+        "Use login_mast first for login/logout queries, worked-hours queries, working-minutes queries, and punch-based attendance details.",
+        "Do not join login_mast to leave tables unless the query explicitly needs leave interpretation or explanation.",
+        "actualWorkingMinutes and shiftWorkingMinutes, when available, can support attendance analytics but raw punch times remain authoritative attendance evidence.",
+        "Logintype may distinguish biometric, WFH, or leave-shift style logging and can be useful when the user asks how attendance was marked.",
     ],
     "emp_leave_setting": [
-        "emp_leave_setting should be treated as the processed leave status table for employee-date leave interpretation.",
-        "Fields such as leave_status, LopCount, EmpLop, markedby, and isApproval are important for operational leave outcome reasoning.",
+        "emp_leave_setting should be treated as the processed final day-status table for leave, permission, weekoff, and operational leave outcomes.",
+        "Key business fields include leave_id, emp_id, leave_date, leave_status, leave_remark, LopCount, isEmployeeCL, EmpLop, markedby, isApproval, previousStatus, previousMarkedBy, and HODComments.",
+        "For simple employee-date leave status questions, prefer emp_leave_setting first.",
+        "A missing row in emp_leave_setting may indicate a normal working day for many daily attendance/leave queries.",
+        "Use leave_remark together with leave_status for better interpretation of LOP, permission, and operational marking logic.",
+        "Use LopCount and EmpLop as strong LOP-related evidence when present.",
     ],
-    "mstEmployeeStatutoryLeave": [
-        "mstEmployeeStatutoryLeave should be used for employee statutory leave records tied to special leave dates.",
+    "Leave_detail": [
+        "Leave_detail stores leave application details such as leav_type, reason, comp_date, frmtime, totime, and apply_date.",
+        "Use Leave_detail when the user asks for leave type, leave reason, leave application details, leave duration intent, or applied date.",
+        "Leave_detail is not required for every day-status query.",
+        "Join Leave_detail through leave_id when leave application context is needed.",
     ],
-    "mstLeaveStatusStatutory": [
-        "mstLeaveStatusStatutory defines statutory leave types and year-wise allocations; it is a policy/reference source, not an attendance event table.",
-    ],
-    "emp_default_shift": [
-        "emp_default_shift stores the employee's default assigned shift and should be used when no better date-range shift assignment is available.",
-    ],
-    "trnEmployeeWeeklyShift": [
-        "trnEmployeeWeeklyShift stores temporary or date-range shift assignments and should take precedence over default shift when the attendance date falls within the weekly shift range.",
+    "leave_dates": [
+        "leave_dates stores date-level leave workflow and leave_day split information.",
+        "Use leave_dates when the question asks about half-day values, per-day approval flow, or whether a particular date was part of a leave application.",
+        "leave_day is important for half-day or partial-day interpretation.",
+        "manager_appr and hr_appr in leave_dates are relevant for workflow and approval reasoning.",
+        "Do not join leave_dates unless day-wise approval or split detail is necessary.",
     ],
     "shift_details": [
-        "shift_details is the authoritative shift timing reference for expected in-time, out-time, and rest interval interpretation.",
-        "Use shift_details when explaining late coming, shift duration, weekly off logic, or whether a shift crosses to the next day.",
+        "shift_details is the authoritative reference for expected shift timing.",
+        "Key business fields include shift_code, shift_name, shift_intime, shift_outtime, shift_restinterval, BreakTimeMin, ShiftSeconds, weekoff, and isNextDay.",
+        "Use shift_details when the user asks about late coming, expected working time, shift comparison, weekoff logic, or shift-based explanation.",
+        "Do not use shift_details for simple login/logout lookup unless shift meaning is explicitly needed.",
     ],
-    "mstShiftNameAndTime": [
-        "mstShiftNameAndTime is a reference table for shift naming and canonical timing display.",
+    "emp_default_shift": [
+        "emp_default_shift stores the employee's default assigned shift.",
+        "Use emp_default_shift when shift assignment is needed and there is no better date-range override.",
+        "Join via emp_id to relate employees to assigned shift_code.",
+    ],
+    "trnEmployeeWeeklyShift": [
+        "trnEmployeeWeeklyShift stores temporary or date-range shift assignments and should take precedence over default shift when the date falls within fromDate and toDate.",
+        "Use trnEmployeeWeeklyShift for temporary shift override reasoning.",
+        "This table is mainly relevant for explanation or shift-specific queries, not simple attendance lookup.",
     ],
     "cl_detail": [
-        "cl_detail is the monthly leave balance and summary table used for CL, LOP, permissions, holidays, and working-days reasoning.",
-        "Use cl_detail for monthly summaries, LOP explanations, permission-based reasoning, and leave balance interpretation.",
+        "cl_detail is the monthly attendance/leave summary layer used for CL balance, LOP, holidays, permissions, working day counts, and payroll-related reasoning.",
+        "Key business fields include emp_id, emp_year, emp_month, CLavailed, CLbalance, LOP, holidays, Permission, company_workingdays, cl_Eligible, and isOBCL.",
+        "Use cl_detail for monthly summary queries, CL balance questions, LOP questions, permission totals, and payroll-oriented attendance reasoning.",
+        "Do not use cl_detail for raw login/logout facts; use login_mast for those.",
     ],
-    "trnExceptionEmployeeCLPolicy": [
-        "trnExceptionEmployeeCLPolicy contains employee-specific exceptions to standard CL policy and should override generic CL policy where applicable.",
+    "emp_compoff": [
+        "emp_compoff should be used for comp-off requests, comp-off approval, comp-off availability, and compensatory-off reasoning.",
+        "Use manager_appr, avail_stat, compoff_reas, and compoff_day when answering comp-off questions.",
+    ],
+    "mstEmployeeStatutoryLeave": [
+        "mstEmployeeStatutoryLeave stores employee statutory leave entries and is relevant when the user explicitly asks about statutory/special leave dates.",
+    ],
+    "mstLeaveStatusStatutory": [
+        "mstLeaveStatusStatutory defines statutory leave types and annual allocation; it is a policy/reference table rather than a day-status fact table.",
     ],
     "mstCLPolicyRule": [
-        "mstCLPolicyRule defines generic casual leave policy counts and should be used for policy explanation rather than transactional attendance proof.",
+        "mstCLPolicyRule defines generic casual leave policy counts and should be used for policy explanation rather than transactional proof.",
+    ],
+    "trnExceptionEmployeeCLPolicy": [
+        "trnExceptionEmployeeCLPolicy contains employee-specific CL policy overrides and should override generic CL policy when applicable.",
     ],
     "mstWeekoffType": [
-        "mstWeekoffType is a reference table for weekly off naming and type interpretation.",
+        "mstWeekoffType is a reference table for weekoff type naming and interpretation.",
     ],
     "holiday_master": [
-        "holiday_master should be used to determine whether a date is a configured holiday before concluding absence or late-related penalties.",
+        "holiday_master defines organization holidays and should be used to determine whether a date is a configured holiday before concluding absence or penalty.",
     ],
     "trnCandidateHolidayMapping": [
-        "trnCandidateHolidayMapping should be checked when holiday applicability can differ by employee or category.",
+        "trnCandidateHolidayMapping should be checked when holiday applicability differs by employee or category.",
     ],
     "pay_mst_category": [
-        "pay_mst_category controls category-level attendance, permission, holiday, and LOP policy behavior.",
+        "pay_mst_category controls category-level attendance, permission, holiday, leave policy, and LOP behavior.",
+        "Use pay_mst_category when the question is category-based or when policy behavior depends on employee category.",
     ],
     "mstRestrictLeaveMarkingCategory": [
-        "mstRestrictLeaveMarkingCategory defines leave-marking restrictions by employee category and should be considered for policy or restriction questions.",
+        "mstRestrictLeaveMarkingCategory defines category-level restriction on leave marking and should be used when the question is about whether leave marking is restricted.",
+    ],
+    "mstShiftNameAndTime": [
+        "mstShiftNameAndTime is a reference table for standardized shift naming and timing display.",
     ],
 }
 
@@ -177,12 +238,13 @@ TABLE_RULES: Dict[str, List[str]] = {
 # ------------------------------------------
 def _extract_software_policy_rules(policy_data: Dict[str, Any]) -> List[str]:
     """
-    Convert uploaded department policy JSON into plain business rules.
+    Convert optional department policy JSON into plain business rules.
     """
     if not policy_data:
         return []
 
     rules: List[str] = []
+
     leave_policy = policy_data.get("leave_policy", {})
     attendance_integration = policy_data.get("attendance_integration_rules", {})
 
@@ -202,29 +264,23 @@ def _extract_software_policy_rules(policy_data: Dict[str, Any]) -> List[str]:
         annual_quota = standard.get("annual_quota")
         monthly_limit = standard.get("monthly_limit")
         if annual_quota is not None:
-            rules.append(
-                f"Software department standard employees have an annual casual leave quota of {annual_quota} days."
-            )
+            rules.append(f"Standard employees have an annual casual leave quota of {annual_quota} days.")
         if monthly_limit is not None:
-            rules.append(
-                f"Software department standard employees have a monthly casual leave limit of {monthly_limit} day."
-            )
+            rules.append(f"Standard employees have a monthly casual leave limit of {monthly_limit} day.")
 
     if external:
         annual_quota = external.get("annual_quota")
         if annual_quota is not None:
-            rules.append(
-                f"Software department external QSecure employees have an annual casual leave quota of {annual_quota} days."
-            )
+            rules.append(f"External QSecure employees have an annual casual leave quota of {annual_quota} days.")
 
     eligibility = casual_leave.get("eligibility", {})
     if eligibility:
         if eligibility.get("interns") is False:
-            rules.append("Software department interns are not eligible for casual leave.")
+            rules.append("Interns are not eligible for casual leave.")
         if eligibility.get("standard_employees") is True:
-            rules.append("Software department standard employees are eligible for casual leave.")
+            rules.append("Standard employees are eligible for casual leave.")
         if eligibility.get("external_qsecure") is True:
-            rules.append("Software department external QSecure employees are eligible for casual leave.")
+            rules.append("External QSecure employees are eligible for casual leave.")
 
     carry_forward = casual_leave.get("carry_forward", {})
     if carry_forward.get("allowed") is True:
@@ -234,234 +290,179 @@ def _extract_software_policy_rules(policy_data: Dict[str, Any]) -> List[str]:
     if permission_policy:
         allowed = permission_policy.get("allowed_per_month")
         duration = permission_policy.get("duration_hours_per_permission")
-        if allowed is not None and duration is not None:
-            rules.append(
-                f"Software department permission policy allows {allowed} permissions per month, each up to {duration} hours."
-            )
+        if allowed is not None:
+            rules.append(f"Permission is allowed {allowed} times per month.")
+        if duration is not None:
+            rules.append(f"Each permission is limited to {duration} hours.")
 
     # Leave penalty
-    unapproved_leave = leave_penalty.get("unapproved_leave", {})
-    uninformed_leave = leave_penalty.get("uninformed_leave", {})
+    if leave_penalty:
+        unapproved = leave_penalty.get("unapproved_leave", {})
+        uninformed = leave_penalty.get("uninformed_leave", {})
 
-    if unapproved_leave.get("penalty_multiplier") is not None:
-        rules.append(
-            f"Unapproved leave has a penalty multiplier of {unapproved_leave['penalty_multiplier']} in the Software department policy."
-        )
+        if unapproved.get("penalty_multiplier") is not None:
+            rules.append(
+                f"Unapproved leave may be penalized at {unapproved['penalty_multiplier']} times the leave duration."
+            )
 
-    if uninformed_leave.get("penalty_multiplier") is not None:
-        rules.append(
-            f"Uninformed leave has a penalty multiplier of {uninformed_leave['penalty_multiplier']} in the Software department policy."
-        )
-
-    additional_action = uninformed_leave.get("additional_action", [])
-    if additional_action:
-        rules.append(
-            "Uninformed leave may trigger additional actions such as "
-            + ", ".join(str(item) for item in additional_action)
-            + "."
-        )
+        if uninformed.get("penalty_multiplier") is not None:
+            rules.append(
+                f"Uninformed leave may be penalized at {uninformed['penalty_multiplier']} times the leave duration."
+            )
 
     # Attendance behavior
     if attendance_behavior_rules:
-        combined_limit = attendance_behavior_rules.get("late_and_permission_combined_limit")
-        exceed_action = attendance_behavior_rules.get("exceed_limit_action")
-        grace_allowed = attendance_behavior_rules.get("grace_time_allowed")
+        limit = attendance_behavior_rules.get("late_and_permission_combined_limit")
+        action = attendance_behavior_rules.get("exceed_limit_action")
+        grace = attendance_behavior_rules.get("grace_time_allowed")
 
-        if combined_limit is not None and exceed_action:
+        if limit is not None and action:
             rules.append(
-                f"If the combined late-and-permission count exceeds {combined_limit}, the action is {exceed_action} under Software department policy."
+                f"If late coming and permission combined exceed {limit}, the action may become {action}."
             )
-
-        if grace_allowed is False:
-            rules.append("Software department attendance behavior policy does not allow grace time.")
+        if grace is False:
+            rules.append("Grace time is not allowed for attendance behavior evaluation.")
 
     # Weekend policy
-    weekend_rules = weekend_policy.get("rules", {})
-    less_than_one_year = weekend_rules.get("less_than_1_year", {})
-    greater_equal_one_year = weekend_rules.get("greater_than_or_equal_1_year", {})
+    if weekend_policy:
+        rules_map = weekend_policy.get("rules", {})
+        less_than_1_year = rules_map.get("less_than_1_year", {})
+        greater_equal_1_year = rules_map.get("greater_than_or_equal_1_year", {})
 
-    if less_than_one_year:
-        working_days = less_than_one_year.get("working_days", [])
-        shift_hours = less_than_one_year.get("shift_hours")
-        if working_days:
-            rules.append(
-                "For Software department employees with less than 1 year experience, working Saturdays include "
-                + ", ".join(str(item) for item in working_days)
-                + "."
-            )
-        if shift_hours is not None:
-            rules.append(
-                f"For Software department employees with less than 1 year experience, weekend shift hours are {shift_hours}."
-            )
+        if less_than_1_year:
+            working_days = less_than_1_year.get("working_days")
+            if working_days:
+                rules.append(
+                    f"For employees with less than 1 year experience, the following Saturdays may be working days: {working_days}."
+                )
 
-    if greater_equal_one_year:
-        saturday = greater_equal_one_year.get("saturday")
-        shift_hours = greater_equal_one_year.get("shift_hours")
-        if saturday:
-            rules.append(
-                f"For Software department employees with 1 year or more experience, Saturday is treated as {saturday}."
-            )
-        if shift_hours is not None:
-            rules.append(
-                f"For Software department employees with 1 year or more experience, weekend shift hours are {shift_hours}."
-            )
+        if greater_equal_1_year:
+            saturday_rule = greater_equal_1_year.get("saturday")
+            if saturday_rule:
+                rules.append(
+                    f"For employees with 1 year or more experience, Saturday rule may be: {saturday_rule}."
+                )
 
     # Special leaves
-    marriage_leave = special_leaves.get("marriage_leave", {})
-    if marriage_leave.get("days") is not None:
-        rules.append(
-            f"Marriage leave in the Software department policy allows {marriage_leave['days']} days."
-        )
-
-    sick_leave = special_leaves.get("sick_leave", {})
-    if sick_leave.get("days") is not None:
-        rules.append(
-            f"Sick leave in the Software department policy allows {sick_leave['days']} days."
-        )
-
-    death_leave = special_leaves.get("death_leave", {})
-    if death_leave.get("days") is not None:
-        rules.append(
-            f"Death leave in the Software department policy allows {death_leave['days']} days."
-        )
-
-    paternity_leave = special_leaves.get("paternity_leave", {})
-    if paternity_leave.get("days") is not None:
-        rules.append(
-            f"Paternity leave in the Software department policy allows {paternity_leave['days']} days."
-        )
+    if special_leaves:
+        for leave_name, details in special_leaves.items():
+            days = details.get("days")
+            if days is not None:
+                readable_name = leave_name.replace("_", " ")
+                rules.append(f"{readable_name.title()} may allow {days} day(s), subject to its conditions.")
 
     # Holiday policy
-    holidays = holiday_policy.get("holidays", [])
-    if holidays:
-        rules.append(
-            "Software department holiday policy includes: " + ", ".join(str(item) for item in holidays) + "."
-        )
+    if holiday_policy:
+        sandwich = holiday_policy.get("sandwich_rule")
+        if sandwich is True:
+            rules.append("Sandwich holiday rule may apply depending on adjacent leave configuration.")
 
-    # Integration flow
-    processing_flow = attendance_integration.get("processing_flow", [])
-    if processing_flow:
-        rules.append(
-            "Attendance and leave integration processing flow is: "
-            + " -> ".join(str(item) for item in processing_flow)
-            + "."
-        )
+    # Attendance integration
+    if attendance_integration:
+        for key, value in attendance_integration.items():
+            if isinstance(value, (str, int, float, bool)):
+                readable_key = str(key).replace("_", " ")
+                rules.append(f"Attendance integration rule - {readable_key}: {value}")
 
     return _dedupe_keep_order(rules)
 
 
 # ------------------------------------------
-# TABLE-BASED RULE AGGREGATION
+# INTERNAL BUILDERS
 # ------------------------------------------
-def _get_table_specific_rules(tables: List[str]) -> List[str]:
+def _rules_for_intent(intent: str) -> List[str]:
+    if intent == "attendance":
+        return COMMON_RULES + HRMS_DAY_STATUS_RULES + ATTENDANCE_RULES
+
+    if intent == "leave":
+        return COMMON_RULES + HRMS_DAY_STATUS_RULES + LEAVE_RULES
+
+    if intent == "attendance_explanation":
+        return COMMON_RULES + HRMS_DAY_STATUS_RULES + ATTENDANCE_RULES + LEAVE_RULES + EXPLANATION_RULES
+
+    if intent == "policy":
+        return COMMON_RULES + HRMS_DAY_STATUS_RULES + POLICY_RULES
+
+    return COMMON_RULES + HRMS_DAY_STATUS_RULES
+
+
+def _rules_for_tables(tables: List[str]) -> List[str]:
     rules: List[str] = []
     for table in tables:
         rules.extend(TABLE_RULES.get(table, []))
-    return _dedupe_keep_order(rules)
+    return rules
 
 
-def _get_cross_table_rules(tables: List[str], intent: str) -> List[str]:
-    selected = _table_set(tables)
+def _build_join_guidance(tables: List[str]) -> List[str]:
+    table_set = _table_set(tables)
     rules: List[str] = []
 
-    if {"login_mast", "emp_leave_setting"}.issubset(selected):
-        rules.append(
-            "When login_mast and emp_leave_setting are both selected, compare attendance date and leave date before concluding whether leave explains an attendance outcome."
-        )
+    if "login_mast" in table_set and "emp_leave_setting" in table_set:
+        rules.append("Join login_mast and emp_leave_setting by emp_id and aligned employee-date only when attendance and processed leave status must be reconciled.")
 
-    if {"Leave_detail", "leave_dates", "emp_leave_setting"}.issubset(selected):
-        rules.append(
-            "When Leave_detail, leave_dates, and emp_leave_setting are all selected, use leave_dates for day-wise validation, Leave_detail for request details, and emp_leave_setting for processed leave status."
-        )
+    if "emp_leave_setting" in table_set and "Leave_detail" in table_set:
+        rules.append("Join emp_leave_setting and Leave_detail using leave_id when leave application details are required.")
 
-    if {"login_mast", "shift_details"}.issubset(selected):
-        rules.append(
-            "When login_mast and shift_details are both selected, compare actual login/logout times with shift timing before inferring late, shortfall, or shift mismatch."
-        )
+    if "emp_leave_setting" in table_set and "leave_dates" in table_set:
+        rules.append("Join emp_leave_setting and leave_dates using leave_id when date-level approval or leave_day split is required.")
 
-    if {"login_mast", "cl_detail"}.issubset(selected):
-        rules.append(
-            "When login_mast and cl_detail are both selected, use login_mast for date-level attendance evidence and cl_detail for monthly summary, LOP, permission, and leave balance interpretation."
-        )
+    if "Leave_detail" in table_set and "leave_dates" in table_set:
+        rules.append("Join Leave_detail and leave_dates using leave_id when both leave application and day-wise leave details are required.")
 
-    if {"emp_default_shift", "trnEmployeeWeeklyShift", "shift_details"}.issubset(selected):
-        rules.append(
-            "When both default shift and weekly shift tables are selected, weekly shift assignments should take precedence for dates within their active range, and shift_details should provide timing interpretation."
-        )
+    if "login_mast" in table_set and "shift_details" in table_set:
+        rules.append("Join login_mast and shift_details using shift_code when shift timing or expected-hours interpretation is required.")
 
-    if {"mstCLPolicyRule", "trnExceptionEmployeeCLPolicy"}.issubset(selected):
-        rules.append(
-            "Employee-specific CL policy exceptions should override the generic CL policy when both tables are selected and applicable."
-        )
+    if "login_mast" in table_set and "emp_default_shift" in table_set:
+        rules.append("Join login_mast and emp_default_shift using emp_id only when assigned default shift matters.")
 
-    if {"holiday_master", "login_mast"}.issubset(selected):
-        rules.append(
-            "Check whether the attendance date falls on a holiday before concluding absence or attendance penalty."
-        )
+    if "login_mast" in table_set and "trnEmployeeWeeklyShift" in table_set:
+        rules.append("Use trnEmployeeWeeklyShift only when temporary/date-range shift assignment matters for the attendance date.")
 
-    if intent == "attendance_explanation":
-        rules.append(
-            "For explanation queries, prefer evidence reconciliation across attendance, leave, shift, holiday, and monthly summary tables instead of relying on one table only."
-        )
+    if "holiday_master" in table_set and ("login_mast" in table_set or "emp_leave_setting" in table_set):
+        rules.append("Use holiday_master only when holiday applicability is needed before concluding absence, late, or penalty.")
 
-    if intent == "policy":
-        rules.append(
-            "For policy questions, distinguish between actual employee transactions and generic policy/reference definitions before answering."
-        )
+    if "cl_detail" in table_set and ("emp_leave_setting" in table_set or "login_mast" in table_set):
+        rules.append("Use cl_detail only for monthly summary, LOP, CL balance, permission count, or payroll-style reasoning, not for raw punch facts.")
 
-    return _dedupe_keep_order(rules)
+    return rules
 
 
 # ------------------------------------------
 # PUBLIC FUNCTION
 # ------------------------------------------
 def get_rules(
-    intent: str,
+    intent: Optional[str],
     tables: List[str],
-    policy_path: Optional[str] = None,
     include_policy_json: bool = True,
+    policy_path: Optional[str] = None,
 ) -> List[str]:
     """
-    Return business rules relevant to the current query intent and selected tables.
+    Return production-ready business rules for the selected intent and tables.
 
-    Sources:
-    1. Base intent rules
-    2. Table-specific rules
-    3. Cross-table reasoning rules
-    4. Optional department policy JSON rules
+    This function is designed to feed context_builder.py
+    with strong HR-aware semantics so the agent avoids hallucination and uses
+    the minimum correct tables.
 
     Args:
         intent:
             attendance / leave / attendance_explanation / policy / irrelevant
         tables:
-            selected table names
-        policy_path:
-            optional override path for department policy JSON
+            Selected tables for the current query
         include_policy_json:
-            whether to include uploaded department policy rules
+            Whether to load optional department policy JSON
+        policy_path:
+            Optional override for policy JSON path
 
     Returns:
         list[str]
     """
     safe_intent = _normalize_intent(intent)
-    selected_tables = [str(table).strip() for table in tables if str(table).strip()]
+    clean_tables = _dedupe_keep_order([str(table).strip() for table in tables if str(table).strip()])
 
     rules: List[str] = []
-    rules.extend(COMMON_RULES)
-
-    if safe_intent == "attendance":
-        rules.extend(ATTENDANCE_RULES)
-    elif safe_intent == "leave":
-        rules.extend(LEAVE_RULES)
-    elif safe_intent == "attendance_explanation":
-        rules.extend(ATTENDANCE_RULES)
-        rules.extend(LEAVE_RULES)
-        rules.extend(EXPLANATION_RULES)
-    elif safe_intent == "policy":
-        rules.extend(POLICY_RULES)
-
-    rules.extend(_get_table_specific_rules(selected_tables))
-    rules.extend(_get_cross_table_rules(selected_tables, safe_intent))
+    rules.extend(_rules_for_intent(safe_intent))
+    rules.extend(_rules_for_tables(clean_tables))
+    rules.extend(_build_join_guidance(clean_tables))
 
     if include_policy_json:
         policy_data = _load_policy_json(policy_path=policy_path)

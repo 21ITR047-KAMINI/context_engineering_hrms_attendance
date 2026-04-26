@@ -1,32 +1,32 @@
 # ==========================================
-# LangGraph Builder (Dynamic SQL Agent Pipeline)
+# LangGraph Builder (One-Agent Dynamic SQL Pipeline)
 # ==========================================
 
 from __future__ import annotations
 
-from langgraph.graph import StateGraph, END
+from langgraph.graph import END, StateGraph
 
 from graph.state import AgentState
 from graph.nodes import (
+    context_builder_node,
+    result_reasoning_node,
     route_query_node,
     schema_selection_node,
-    context_builder_node,
+    should_continue_after_routing,
+    should_retry_after_execution,
+    should_retry_after_validation,
+    sql_correction_node,
+    sql_execution_node,
     sql_generation_node,
     sql_validation_node,
-    sql_execution_node,
-    sql_correction_node,
-    result_reasoning_node,
-    should_continue_after_routing,
-    should_retry_after_validation,
-    should_retry_after_execution,
 )
 
 
 def build_graph():
     """
-    Build the NexusOpt dynamic execution graph.
+    Build the one-agent HRMS execution graph.
 
-    Flow:
+    Final flow:
         route_query
             -> schema_selection
             -> context_builder
@@ -38,6 +38,12 @@ def build_graph():
                 -> sql_correction (if DB error and retries remain)
             -> result_reasoning
             -> END
+
+    Notes:
+    - There is only one active execution pipeline.
+    - Router decides whether the query should continue or stop as irrelevant.
+    - SQL correction is shared for both validation and execution failures.
+    - Result reasoning handles both lookup-mode and reasoning-mode responses.
     """
     graph = StateGraph(AgentState)
 
@@ -112,36 +118,7 @@ def build_graph():
 
     compiled_graph = graph.compile()
 
-    # ------------------------------------------
-    # OPTIONAL GRAPH VISUALIZATION
-    # ------------------------------------------
-    _print_graph_structure(compiled_graph)
+    # Optional development-time graph print
+    #_print_graph_structure(compiled_graph)
 
     return compiled_graph
-
-
-def _print_graph_structure(compiled_graph) -> None:
-    """
-    Print graph structure for debugging and development.
-    """
-    print("\n=== GRAPH STRUCTURE ===")
-
-    try:
-        internal_graph = compiled_graph.get_graph()
-
-        print("\nNodes:")
-        for node in internal_graph.nodes:
-            print(f" - {node}")
-
-        print("\nEdges:")
-        for edge in internal_graph.edges:
-            print(f" {edge.source} -> {edge.target}")
-
-        try:
-            print("\n=== MERMAID DIAGRAM ===")
-            print(internal_graph.draw_mermaid())
-        except Exception:
-            pass
-
-    except Exception as exc:
-        print("[GRAPH PRINT ERROR]:", str(exc))
