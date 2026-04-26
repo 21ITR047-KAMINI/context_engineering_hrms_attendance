@@ -1,1 +1,92 @@
-# context_engineering_hrms_attendance
+# HR Attendance AI Assistant
+
+A Streamlit-based HR analytics assistant that answers attendance and leave questions using an agentic workflow, SQL tools, and LLM-assisted reasoning.
+
+## Features
+
+- Conversational HR assistant UI built with Streamlit.
+- Attendance, leave, and explanatory query handling through agent routing.
+- SQL generation, validation, execution, and result explanation pipeline.
+- Schema-aware context builder for better query accuracy.
+- Enterprise-style UI with topbar, sidebar history, prompt chips, and KPI cards.
+
+## Tech Stack
+
+- Python 3.10+
+- Streamlit
+- LangChain + LangGraph
+- SQLAlchemy + pyodbc
+- Ollama (for LLM inference)
+- Pandas
+
+## Project Structure
+
+```text
+.
+├── app.py
+├── agents/
+├── graph/
+├── llm/
+├── rag/
+├── services/
+├── sql/
+├── tools/
+├── ui/
+├── assets/
+└── requirements.txt
+```
+
+## Prerequisites
+
+- Python 3.10 or 3.11
+- Access to a SQL Server instance
+- ODBC Driver 17 for SQL Server installed
+- Ollama server running and models pulled
+
+## Environment Variables
+
+Create a `.env` file in the project root with:
+
+```env
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL_SQL=qwen2.5-coder:7b
+OLLAMA_MODEL_Exp=llama3.1:8b
+
+DB_SERVER=<sql-server-host>
+DB_NAME=<database-name>
+DB_USER=<db-username>
+DB_PASSWORD=<db-password>
+```
+
+## Installation
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## Run the App
+
+```bash
+streamlit run app.py
+```
+
+Then open: `http://localhost:8501`
+
+## Deployment (Recommended)
+
+- Push code to GitHub.
+- Deploy using Streamlit Community Cloud.
+- Set environment variables/secrets in host settings.
+- Use `app.py` as the entrypoint.
+
+## Troubleshooting
+
+- **Ollama connection error:** verify `OLLAMA_BASE_URL` and model names.
+- **DB connection failure:** verify SQL credentials/network and ODBC driver.
+- **UI loads but answers fail:** verify both DB and LLM services are reachable.
+
+## License
+
+Internal / Proprietary (update as per organization policy).
