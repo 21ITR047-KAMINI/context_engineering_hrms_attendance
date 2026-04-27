@@ -16,3 +16,4 @@ pydantic
 requests
 pandas
 tiktoken
+langchain-google-genai

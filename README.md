@@ -16,7 +16,7 @@ A Streamlit-based HR analytics assistant that answers attendance and leave quest
 - Streamlit
 - LangChain + LangGraph
 - SQLAlchemy + pyodbc
-- Ollama (for LLM inference)
+- Ollama or Gemini (for LLM inference)
 - Pandas
 
 ## Project Structure
@@ -48,9 +48,17 @@ A Streamlit-based HR analytics assistant that answers attendance and leave quest
 Create a `.env` file in the project root with:
 
 ```env
+# LLM provider selection: ollama (default) or gemini
+LLM_PROVIDER=ollama
+
+# Ollama config (required when LLM_PROVIDER=ollama)
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL_SQL=qwen2.5-coder:7b
 OLLAMA_MODEL_Exp=llama3.1:8b
+
+# Gemini config (required when LLM_PROVIDER=gemini)
+GEMINI_API_KEY=XXX
+GEMINI_MODEL=gemini-2.5-flash
 
 DB_SERVER=<sql-server-host>
 DB_NAME=<database-name>
@@ -84,6 +92,7 @@ Then open: `http://localhost:8501`
 ## Troubleshooting
 
 - **Ollama connection error:** verify `OLLAMA_BASE_URL` and model names.
+- **Gemini auth/model error:** verify `GEMINI_API_KEY`, `GEMINI_MODEL`, and that `LLM_PROVIDER=gemini`.
 - **DB connection failure:** verify SQL credentials/network and ODBC driver.
 - **UI loads but answers fail:** verify both DB and LLM services are reachable.
 
