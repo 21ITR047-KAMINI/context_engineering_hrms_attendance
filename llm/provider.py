@@ -1,5 +1,5 @@
 # ==========================================
-# LLM Provider (Ollama)
+# LLM Provider (Ollama + Gemini)
 # ==========================================
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
@@ -19,18 +20,12 @@ load_dotenv()
 # CONSTANTS
 # ------------------------------------------
 DEFAULT_REQUEST_TIMEOUT = 5
+DEFAULT_PROVIDER = "ollama"
 
 
 # ------------------------------------------
 # CONFIG HELPERS
 # ------------------------------------------
-def _get_base_url() -> str:
-    base_url = os.getenv("OLLAMA_BASE_URL", "").strip()
-    if not base_url:
-        raise ValueError("Missing OLLAMA_BASE_URL in .env")
-    return base_url.rstrip("/")
-
-
 def _safe_float_env(name: str, default: float) -> float:
     value = os.getenv(name, "").strip()
     if not value:
@@ -53,22 +48,25 @@ def _safe_int_env(name: str, default: int) -> int:
         return default
 
 
-def _resolve_model_name(task_type: str) -> str:
+def _get_provider() -> str:
+    provider = os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER).strip().lower()
+    if provider not in {"ollama", "gemini"}:
+        raise ValueError(
+            "Invalid LLM_PROVIDER. Supported values: 'ollama' or 'gemini'."
+        )
+    return provider
+
+
+def _get_ollama_base_url() -> str:
+    base_url = os.getenv("OLLAMA_BASE_URL", "").strip()
+    if not base_url:
+        raise ValueError("Missing OLLAMA_BASE_URL in .env")
+    return base_url.rstrip("/")
+
+
+def _resolve_ollama_model_name(task_type: str) -> str:
     """
-    Resolve model by task type.
-
-    Supported task types:
-    - sql
-    - router
-    - explanation
-    - general
-
-    Env support:
-    - OLLAMA_MODEL_SQL
-    - OLLAMA_MODEL_ROUTER
-    - OLLAMA_MODEL_EXPLANATION
-    - OLLAMA_MODEL_GENERAL
-    - OLLAMA_MODEL_Exp (legacy fallback, optional)
+    Resolve Ollama model by task type.
     """
     task = (task_type or "general").strip().lower()
 
@@ -108,46 +106,71 @@ def _resolve_model_name(task_type: str) -> str:
     return model_name
 
 
+def _resolve_gemini_model_name(task_type: str) -> str:
+    """
+    Resolve Gemini model by task type.
+
+    Supported env vars:
+    - GEMINI_MODEL_SQL
+    - GEMINI_MODEL_ROUTER
+    - GEMINI_MODEL_EXPLANATION
+    - GEMINI_MODEL_GENERAL
+    - GEMINI_MODEL (global fallback, defaults to gemini-2.5-flash)
+    """
+    task = (task_type or "general").strip().lower()
+    global_default = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
+    if task == "sql":
+        model_name = os.getenv("GEMINI_MODEL_SQL", "").strip() or global_default
+    elif task == "router":
+        model_name = (
+            os.getenv("GEMINI_MODEL_ROUTER", "").strip()
+            or os.getenv("GEMINI_MODEL_GENERAL", "").strip()
+            or os.getenv("GEMINI_MODEL_EXPLANATION", "").strip()
+            or global_default
+        )
+    elif task == "explanation":
+        model_name = (
+            os.getenv("GEMINI_MODEL_EXPLANATION", "").strip()
+            or os.getenv("GEMINI_MODEL_GENERAL", "").strip()
+            or global_default
+        )
+    else:
+        model_name = os.getenv("GEMINI_MODEL_GENERAL", "").strip() or global_default
+
+    if not model_name:
+        raise ValueError("Missing Gemini model configuration in .env")
+
+    return model_name
+
+
 def _task_settings(task_type: str) -> Dict[str, Any]:
     """
-    Per-task LLM settings.
-
-    Defaults are intentionally conservative to reduce GPU memory pressure.
-    Each task can also be overridden from .env if needed.
-
-    Supported overrides:
-    - OLLAMA_TEMPERATURE_SQL
-    - OLLAMA_TEMPERATURE_ROUTER
-    - OLLAMA_TEMPERATURE_EXPLANATION
-    - OLLAMA_TEMPERATURE_GENERAL
-    - OLLAMA_NUM_CTX_SQL
-    - OLLAMA_NUM_CTX_ROUTER
-    - OLLAMA_NUM_CTX_EXPLANATION
-    - OLLAMA_NUM_CTX_GENERAL
+    Provider-agnostic per-task LLM settings.
     """
     task = (task_type or "general").strip().lower()
 
     if task == "sql":
         return {
-            "temperature": _safe_float_env("OLLAMA_TEMPERATURE_SQL", 0.0),
-            "num_ctx": _safe_int_env("OLLAMA_NUM_CTX_SQL", 4096),
+            "temperature": _safe_float_env("LLM_TEMPERATURE_SQL", 0.0),
+            "num_ctx": _safe_int_env("LLM_NUM_CTX_SQL", 4096),
         }
 
     if task == "router":
         return {
-            "temperature": _safe_float_env("OLLAMA_TEMPERATURE_ROUTER", 0.0),
-            "num_ctx": _safe_int_env("OLLAMA_NUM_CTX_ROUTER", 1024),
+            "temperature": _safe_float_env("LLM_TEMPERATURE_ROUTER", 0.0),
+            "num_ctx": _safe_int_env("LLM_NUM_CTX_ROUTER", 1024),
         }
 
     if task == "explanation":
         return {
-            "temperature": _safe_float_env("OLLAMA_TEMPERATURE_EXPLANATION", 0.2),
-            "num_ctx": _safe_int_env("OLLAMA_NUM_CTX_EXPLANATION", 1024),
+            "temperature": _safe_float_env("LLM_TEMPERATURE_EXPLANATION", 0.2),
+            "num_ctx": _safe_int_env("LLM_NUM_CTX_EXPLANATION", 1024),
         }
 
     return {
-        "temperature": _safe_float_env("OLLAMA_TEMPERATURE_GENERAL", 0.2),
-        "num_ctx": _safe_int_env("OLLAMA_NUM_CTX_GENERAL", 2048),
+        "temperature": _safe_float_env("LLM_TEMPERATURE_GENERAL", 0.2),
+        "num_ctx": _safe_int_env("LLM_NUM_CTX_GENERAL", 2048),
     }
 
 
@@ -191,13 +214,6 @@ def list_available_models(base_url: str) -> Tuple[str, ...]:
 def check_model_available(base_url: str, model: str) -> Tuple[bool, List[str], Optional[str]]:
     """
     Check exact or base-name match.
-
-    Example:
-    requested: llama3.1:8b
-    available: llama3.1:8b, llama3.1:latest
-
-    Returns:
-        (is_available, available_models, resolved_model_name)
     """
     try:
         model_names = list(list_available_models(base_url))
@@ -218,40 +234,47 @@ def check_model_available(base_url: str, model: str) -> Tuple[bool, List[str], O
     return False, model_names, None
 
 
-# ------------------------------------------
-# MAIN LLM FACTORY
-# ------------------------------------------
 @lru_cache(maxsize=12)
-def get_llm(task_type: str = "general") -> ChatOllama:
+def get_llm(task_type: str = "general") -> Any:
     """
-    Return an Ollama-backed ChatOllama instance based on task type.
+    Return an LLM instance based on the selected provider.
 
-    task_type:
-    - "sql"         -> SQL generation / correction
-    - "router"      -> intent classification
-    - "explanation" -> explanation reasoning
-    - "general"     -> default reasoning
-
-    This function is cached so repeated calls reuse the same client config.
+    Set `LLM_PROVIDER=ollama` (default) or `LLM_PROVIDER=gemini`.
     """
     task = (task_type or "general").strip().lower()
-    base_url = _get_base_url()
-    requested_model_name = _resolve_model_name(task)
+    provider = _get_provider()
     settings = _task_settings(task)
 
-    print(f"[LLM] Task: {task} -> Requested Model: {requested_model_name}")
-    print(f"[LLM] Connecting to: {base_url}")
+    print(f"[LLM] Provider: {provider} | Task: {task}")
     print(
         f"[LLM] Settings -> temperature: {settings['temperature']}, "
         f"num_ctx: {settings['num_ctx']}"
     )
 
-    # Validate server
+    if provider == "gemini":
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("Missing GEMINI_API_KEY in .env")
+
+        model_name = _resolve_gemini_model_name(task)
+        print(f"[LLM] Gemini model: {model_name}")
+
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            temperature=settings["temperature"],
+            google_api_key=api_key,
+        )
+
+    base_url = _get_ollama_base_url()
+    requested_model_name = _resolve_ollama_model_name(task)
+
+    print(f"[LLM] Ollama requested model: {requested_model_name}")
+    print(f"[LLM] Connecting to: {base_url}")
+
     server_ok, server_error = check_ollama_server(base_url)
     if not server_ok:
         raise ConnectionError(f"Ollama server not reachable: {server_error}")
 
-    # Validate model
     model_ok, available_models, resolved_model_name = check_model_available(base_url, requested_model_name)
     if not model_ok or not resolved_model_name:
         raise ValueError(
@@ -259,7 +282,7 @@ def get_llm(task_type: str = "general") -> ChatOllama:
             f"Available models: {available_models}"
         )
 
-    print(f"[LLM] Using Model: {resolved_model_name}")
+    print(f"[LLM] Using Ollama model: {resolved_model_name}")
 
     return ChatOllama(
         model=resolved_model_name,
